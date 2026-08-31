@@ -137,7 +137,7 @@ def fetch(url: str, target: Path | None) -> None:
     "--cwd",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
     default=None,
-    help="Directory to run `zig build` from (default: current directory).",
+    help="Directory to run `zig build` from (default: this package's vendored copy).",
 )
 @click.option(
     "--zig",

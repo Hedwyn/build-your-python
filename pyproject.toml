@@ -17,3 +17,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["py/metapython"]
+exclude = ["cpython/.git"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"build.zig" = "metapython/_vendor/build.zig"
+"build.zig.zon" = "metapython/_vendor/build.zig.zon"
+"build" = "metapython/_vendor/build"
+"cpython" = "metapython/_vendor/cpython"

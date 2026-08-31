@@ -53,6 +53,13 @@ type Library = Literal[
     "openssl", "libffi", "ncurses", "readline", "sqlite", "zlib", "bz2", "lzma", "tk"
 ]
 
+#: `build.zig`, `build.zig.zon`, `build/`, and the `cpython` submodule are
+#: force-included into the wheel as siblings under this directory (see
+#: pyproject.toml). build.zig resolves `cpython`'s path relative to its own
+#: location, so this is the only place that needs to know it -- `zig_build`
+#: below just needs to run with this as `cwd` for the two to line up.
+VENDORED_PROJECT_DIR = Path(__file__).parent / "_vendor"
+
 
 @dataclass(frozen=True, slots=True)
 class BuildOptions:
@@ -95,8 +102,13 @@ def zig_build(
 
     `zig` is the path to the `zig` executable; if omitted, the pinned
     toolchain is fetched (see `metapython.fetch`) and used.
+
+    `cwd` is the directory to run `zig build` from, i.e. where it looks for
+    `build.zig` and, relative to that, the `cpython` source tree. If omitted,
+    defaults to the vendored copy bundled in this package (`VENDORED_PROJECT_DIR`).
     """
     executable = zig if zig is not None else fetch.zig_toolchain()
+    directory = cwd if cwd is not None else VENDORED_PROJECT_DIR
     args = [
         str(executable),
         "build",
@@ -104,4 +116,4 @@ def zig_build(
         *options.to_args(),
         *extra_args,
     ]
-    return subprocess.run(args, cwd=cwd, check=True)
+    return subprocess.run(args, cwd=directory, check=True)
