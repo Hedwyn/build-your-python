@@ -8,6 +8,11 @@
 //! Makefile with `make` -- see build/makefile.zig, which reads it purely as
 //! data (object lists, per-module CFLAGS/LDFLAGS, frozen-module recipes) so
 //! we can add the equivalent Zig compile steps ourselves (see build/utils.zig).
+//!
+//! `./configure` also generates `pyconfig.h`; pass `-Dpyconfig-header=<path>`
+//! to overwrite it with your own afterward (see build/utils.zig's
+//! runConfigure) -- useful when cross-compiling, since autoconf's detection
+//! can't execute target-arch test programs.
 
 const std = @import("std");
 const Makefile = @import("build/makefile.zig");
@@ -44,7 +49,7 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     const cpython_dir = b.path("cpython");
     const prefix = b.pathJoin(&.{ build_root, "zig-out" });
 
-    Utils.runConfigure(b, cpython_dir_str, prefix, target, optimize);
+    Utils.runConfigure(b, cpython_dir_str, prefix, target, optimize, options.pyconfig_header);
 
     const makefile_path = b.pathJoin(&.{ cpython_dir_str, "Makefile" });
     const text = std.Io.Dir.cwd().readFileAlloc(b.graph.io, makefile_path, gpa, .unlimited) catch |err|

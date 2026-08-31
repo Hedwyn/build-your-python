@@ -64,6 +64,7 @@ pub fn runConfigure(
     prefix: []const u8,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    pyconfig_header: ?[]const u8,
 ) void {
     const makefile_path = b.pathJoin(&.{ cpython_dir, "Makefile" });
     std.Io.Dir.cwd().access(b.graph.io, makefile_path, .{}) catch {
@@ -93,8 +94,17 @@ pub fn runConfigure(
             std.debug.print("{s}\n{s}\n", .{ result.stdout, result.stderr });
             std.debug.panic("./configure failed", .{});
         }
-        return;
     };
+
+    // Regardless of whether ./configure just ran or was skipped (cached
+    // Makefile from a prior run), a user-supplied pyconfig.h always wins:
+    // overwrite whatever autoconf produced/left behind. Bypasses autoconf's
+    // detection results without needing to skip ./configure -- Makefile is
+    // still required for the makesetup-derived module/object lists.
+    if (pyconfig_header) |src| {
+        std.Io.Dir.cwd().copyFile(src, std.Io.Dir.cwd(), b.pathJoin(&.{ cpython_dir, "pyconfig.h" }), b.graph.io, .{}) catch |err|
+            std.debug.panic("failed to copy pyconfig-header {s}: {t}", .{ src, err });
+    }
 }
 
 pub const ExeOptions = struct {

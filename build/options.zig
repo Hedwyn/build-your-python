@@ -41,6 +41,13 @@ pub const BuildOptions = struct {
     /// on `-rdynamic` to export the (possibly static, unregistered) main
     /// executable's own symbols.
     python_linkage: ?Linkage,
+    /// Path to an existing `pyconfig.h` to drop into the CPython source tree
+    /// instead of the one `./configure` generates. `./configure` still runs
+    /// (its own `pyconfig.h` output is just overwritten afterward) since its
+    /// other output, `Makefile`, is still needed. Useful when cross-compiling:
+    /// autoconf's `HAVE_*`/`ac_cv_*` detection can't execute target-arch test
+    /// programs and falls back to conservative (often wrong) guesses.
+    pyconfig_header: ?[]const u8,
 };
 
 const lib_names = [_][]const u8{
@@ -115,6 +122,12 @@ pub fn parseOptions(b: *std.Build) BuildOptions {
         "Linkage for the core interpreter library: static, dynamic, or off (default: off)",
     ) orelse "off";
     options.python_linkage = parseLinkage(python_raw);
+
+    options.pyconfig_header = b.option(
+        []const u8,
+        "pyconfig-header",
+        "Path to an existing pyconfig.h to use instead of the one ./configure generates",
+    );
     if (options.python_linkage == .dynamic and options.libc_linkage == .static)
         std.debug.panic(
             "python-linkage=dynamic requires libc-linkage=dynamic: a statically " ++
