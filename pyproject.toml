@@ -5,6 +5,12 @@ description = "A Python library to build your own CPython executable"
 requires-python = ">=3.12"
 dependencies = []
 
+[project.optional-dependencies]
+cli = ["click"]
+
+[project.scripts]
+metapython = "metapython.cli:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
