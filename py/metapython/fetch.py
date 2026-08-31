@@ -10,6 +10,7 @@ PyPI package) and stage it on disk.
 from __future__ import annotations
 
 import contextlib
+import logging
 import shutil
 import tarfile
 import tempfile
@@ -24,11 +25,16 @@ MIRROR_URL = (
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "metapython" / "zig"
 
+_logger = logging.getLogger(__name__)
+
 
 def download(url: str, dest: Path) -> Path:
     """Download `url` to the file `dest` and return it."""
+    _logger.info("downloading %s -> %s", url, dest)
     with urllib.request.urlopen(url) as response, dest.open("wb") as out:
         shutil.copyfileobj(response, out)
+    size = dest.stat().st_size
+    _logger.info("downloaded %s (%d bytes)", url, size)
     return dest
 
 
@@ -52,6 +58,7 @@ def fetch(url: str = MIRROR_URL, *, target: Path | None = None) -> Iterator[Path
             downloaded = download(url, Path(tmp.name))
         dest = directory_path / Path(url).name
         shutil.move(downloaded, dest)
+        _logger.info("staged archive at %s", dest)
         yield dest
 
 
@@ -66,6 +73,7 @@ def extract(archive: Path, dest: Path) -> Path:
     Returns the path to the `zig` executable inside the extracted toolchain.
     """
     dest.mkdir(parents=True, exist_ok=True)
+    _logger.info("extracting %s -> %s", archive, dest)
     with tarfile.open(archive) as tar:
         tar.extractall(dest, filter="data")
     return dest / archive_stem(archive.name) / "zig"
@@ -81,6 +89,8 @@ def zig_toolchain(
     """
     executable = cache_dir / archive_stem(url) / "zig"
     if executable.exists():
+        _logger.info("using cached toolchain at %s", executable)
         return executable
+    _logger.info("no cached toolchain at %s, fetching %s", executable, url)
     with fetch(url) as archive:
         return extract(archive, cache_dir)

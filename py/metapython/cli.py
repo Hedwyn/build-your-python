@@ -8,6 +8,7 @@ Command-line interface to metapython. Requires the optional `cli` extra
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from typing import get_args
@@ -34,6 +35,8 @@ from .compile import (
 
 LIBRARIES = get_args(Library)
 
+LOG_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")
+
 
 def _parse_library(value: str) -> tuple[Library, Linkage]:
     name, _, linkage = value.partition("=")
@@ -53,8 +56,23 @@ def _parse_library(value: str) -> tuple[Library, Linkage]:
 
 
 @click.group()
-def cli() -> None:
+@click.option(
+    "--log-level",
+    type=click.Choice(LOG_LEVELS, case_sensitive=False),
+    default="WARNING",
+    show_default=True,
+    help="Logging verbosity.",
+)
+@click.option(
+    "-v",
+    "--verbose",
+    count=True,
+    help="Increase logging verbosity (-v: INFO, -vv: DEBUG). Overrides --log-level.",
+)
+def cli(log_level: str, verbose: int) -> None:
     """Ship CPython source + Zig toolchain; build a static interpreter."""
+    level = ["WARNING", "INFO", "DEBUG"][min(verbose, 2)] if verbose else log_level
+    logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
 
 
 @cli.command()
