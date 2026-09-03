@@ -41,6 +41,20 @@ pub const BuildOptions = struct {
     /// on `-rdynamic` to export the (possibly static, unregistered) main
     /// executable's own symbols.
     python_linkage: ?Linkage,
+    /// Whether to drop debug info (and the symbol table) from every artifact
+    /// this build produces, at link time. `null` leaves Zig's own per-optimize
+    /// -mode default in place.
+    ///
+    /// Worth an explicit knob rather than riding on `optimize`: CPython's own
+    /// `PY_CORE_CFLAGS` carry `-g` unconditionally (they come out of the
+    /// `./configure`-generated Makefile, which has no notion of this build's
+    /// optimize mode), so a `ReleaseFast` build still emits full DWARF for
+    /// every one of the ~1500 core translation units and every extension
+    /// module. Measured on a native x86_64 build: `libpython3.12.so` 24.5 MB
+    /// -> 7.3 MB, and the 62 `lib-dynload` modules 14 MB -> 4 MB, purely from
+    /// stripping. Consumers that bundle this interpreter into a distributable
+    /// (see smelt) pay that on every copy.
+    strip: ?bool,
     /// Path to an existing `pyconfig.h` to drop into the CPython source tree
     /// instead of the one `./configure` generates. `./configure` still runs
     /// (its own `pyconfig.h` output is just overwritten afterward) since its
@@ -48,6 +62,26 @@ pub const BuildOptions = struct {
     /// autoconf's `HAVE_*`/`ac_cv_*` detection can't execute target-arch test
     /// programs and falls back to conservative (often wrong) guesses.
     pyconfig_header: ?[]const u8,
+    /// Extension module names to compile directly into the main `python`
+    /// executable (CPython's own "builtin module" mechanism: a `PyInit_<name>`
+    /// C function linked straight in and registered in a static
+    /// `_PyImport_Inittab`, called directly -- no separate `.so`, no
+    /// `dlopen()`, no dynamic linking of any kind) instead of building them
+    /// as ordinary shared modules.
+    ///
+    /// Exists specifically for `libc-linkage=static` targets where `dlopen()`
+    /// itself doesn't work: `-Dtarget=x86_64-linux-musl` was verified
+    /// empirically (both plain-static and static-PIE) to compile clean,
+    /// correctly populate `_PyImport_DynLoadFiletab`, and then fail *every*
+    /// `dlopen()` call at runtime with musl's own `dlerror()` text ("Dynamic
+    /// loading not supported" -- confirmed absent from CPython's own source
+    /// entirely, so it's musl's libc refusing, not a CPython-side check).
+    /// Bypassing `dlopen()` entirely for the modules named here is the only
+    /// way found so far to get a `libc-linkage=static` build with working
+    /// extension modules at all. Only meaningful with `python-linkage=off`
+    /// (see build.zig): that's the only shape where the modules end up in the
+    /// same compilation unit as the symbols their `PyInit_*` functions need.
+    static_modules: []const []const u8,
 };
 
 const lib_names = [_][]const u8{
@@ -123,11 +157,30 @@ pub fn parseOptions(b: *std.Build) BuildOptions {
     ) orelse "off";
     options.python_linkage = parseLinkage(python_raw);
 
+    options.strip = b.option(
+        bool,
+        "strip",
+        "Strip debug info and symbols from the produced artifacts (default: Zig's per-optimize-mode default)",
+    );
+
     options.pyconfig_header = b.option(
         []const u8,
         "pyconfig-header",
         "Path to an existing pyconfig.h to use instead of the one ./configure generates",
     );
+
+    const static_modules_raw = b.option(
+        []const u8,
+        "static-modules",
+        "Comma-separated module names to compile as builtins (no dlopen) instead of shared .so's",
+    ) orelse "";
+    var static_modules: std.ArrayList([]const u8) = .empty;
+    var static_modules_it = std.mem.splitScalar(u8, static_modules_raw, ',');
+    while (static_modules_it.next()) |name| {
+        if (name.len > 0) static_modules.append(b.allocator, name) catch @panic("OOM");
+    }
+    options.static_modules = static_modules.items;
+
     if (options.python_linkage == .dynamic and options.libc_linkage == .static)
         std.debug.panic(
             "python-linkage=dynamic requires libc-linkage=dynamic: a statically " ++
@@ -184,6 +237,15 @@ pub fn isModuleDisabled(options: BuildOptions, name: []const u8) bool {
         for (dep.modules) |m| {
             if (std.mem.eql(u8, m, name)) return @field(options, dep.linkage_field) == null;
         }
+    }
+    return false;
+}
+
+/// True if `name` was requested via `-Dstatic-modules=...` (see
+/// `BuildOptions.static_modules`).
+pub fn isModuleForcedStatic(options: BuildOptions, name: []const u8) bool {
+    for (options.static_modules) |m| {
+        if (std.mem.eql(u8, m, name)) return true;
     }
     return false;
 }

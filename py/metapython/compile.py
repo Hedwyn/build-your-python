@@ -71,6 +71,13 @@ class BuildOptions:
     libc_linkage: LibCLinkage | None = None
     python_linkage: Linkage | None = None
     pyconfig_header: Path | None = None
+    #: Drop debug info and symbols from every produced artifact at link time.
+    #: `None` leaves Zig's own per-optimize-mode default. Not implied by
+    #: `optimize`: CPython's `PY_CORE_CFLAGS` carry `-g` unconditionally (they
+    #: come from the ./configure-generated Makefile, which knows nothing about
+    #: this build's optimize mode), so even a release build emits full DWARF
+    #: without this.
+    strip: bool | None = None
 
     def to_args(self) -> list[str]:
         """Render as `zig build` CLI arguments (`-Dname=value`)."""
@@ -87,6 +94,8 @@ class BuildOptions:
             args.append(f"-Dpython-linkage={self.python_linkage.value}")
         if self.pyconfig_header is not None:
             args.append(f"-Dpyconfig-header={self.pyconfig_header}")
+        if self.strip is not None:
+            args.append(f"-Dstrip={str(self.strip).lower()}")
         return args
 
 

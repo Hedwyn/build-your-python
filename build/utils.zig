@@ -169,10 +169,11 @@ pub fn addExe(
     cpython_dir: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    strip: ?bool,
     gpa: std.mem.Allocator,
     opts: ExeOptions,
 ) *std.Build.Step.Compile {
-    const mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+    const mod = b.createModule(.{ .target = target, .optimize = optimize, .strip = strip, .link_libc = true });
     addCoreObjects(
         b,
         cpython_dir,
@@ -218,10 +219,11 @@ pub fn addPythonLib(
     cpython_dir: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    strip: ?bool,
     gpa: std.mem.Allocator,
     opts: LibPythonOptions,
 ) *std.Build.Step.Compile {
-    const mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+    const mod = b.createModule(.{ .target = target, .optimize = optimize, .strip = strip, .link_libc = true });
     addCoreObjects(
         b,
         cpython_dir,
@@ -349,6 +351,7 @@ pub fn addSharedModule(
     gpa: std.mem.Allocator,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    strip: ?bool,
     common_cflags: []const []const u8,
     name: []const u8,
     overrides: []const StaticOverride,
@@ -363,7 +366,7 @@ pub fn addSharedModule(
         return null;
     };
 
-    const mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+    const mod = b.createModule(.{ .target = target, .optimize = optimize, .strip = strip, .link_libc = true });
     mod.addIncludePath(cpython_dir);
     mod.addIncludePath(cpython_dir.path(b, "Include"));
     mod.addIncludePath(cpython_dir.path(b, "Include/internal"));
@@ -416,4 +419,113 @@ pub fn addSharedModule(
     }
 
     return b.addLibrary(.{ .name = name, .root_module = mod, .linkage = .dynamic });
+}
+
+/// The "builtin module" counterpart to `addSharedModule`: adds `name`'s
+/// sources/flags directly onto `target_mod` (the main `python` executable's
+/// own root module) instead of creating a separate shared-library artifact --
+/// no `.so`, no `dlopen()`, no dynamic linking involved for this module at
+/// all. Shares all of `addSharedModule`'s source/flag/static-override
+/// resolution logic (same Makefile-derived build rule), just without the
+/// separate-library wrapping or the `python_lib`/`addRPathSpecial` dance
+/// (irrelevant here: a builtin module's Python C-API references resolve via
+/// ordinary same-executable linking, not a runtime dependency on anything).
+///
+/// Returns `false` (after printing the same warning `addSharedModule` would)
+/// if no build rule exists for `name`, or if it needs an unrecognized bundled
+/// archive -- same not-buildable-here cases, not a builtin-vs-shared
+/// distinction. Callers must skip registering the module in
+/// `_PyImport_Inittab` when this returns `false` (see build.zig): a `false`
+/// here means no object code for it was actually added, and declaring a
+/// `PyInit_<name>` extern with nothing to define it is a link error.
+pub fn addBuiltinModule(
+    b: *std.Build,
+    cpython_dir: std.Build.LazyPath,
+    mk: Makefile,
+    gpa: std.mem.Allocator,
+    target_mod: *std.Build.Module,
+    common_cflags: []const []const u8,
+    name: []const u8,
+    overrides: []const StaticOverride,
+) bool {
+    const rule = mk.findSharedModuleRule(gpa, name) orelse {
+        std.debug.print("warning: no build rule found for module '{s}', skipping\n", .{name});
+        return false;
+    };
+
+    var upper_buf: [64]u8 = undefined;
+    const upper_name = std.ascii.upperString(&upper_buf, name);
+    const fallback_cflags_raw = std.mem.concat(
+        gpa,
+        []const u8,
+        &.{ common_cflags, Makefile.tokens(gpa, mk.get(gpa, b.fmt("MODULE_{s}_CFLAGS", .{upper_name}))) },
+    ) catch @panic("OOM");
+
+    for (rule.prereqs) |tok| {
+        if (!std.mem.endsWith(u8, tok, ".o")) continue;
+        const src = b.fmt("{s}c", .{tok[0 .. tok.len - 1]});
+        const flags_raw = if (mk.findObjectFlags(gpa, tok)) |f| Makefile.tokens(gpa, f) else fallback_cflags_raw;
+        target_mod.addCSourceFile(.{
+            .file = cpython_dir.path(b, src),
+            .flags = extractIncludePaths(target_mod, b, cpython_dir, gpa, flags_raw),
+        });
+    }
+
+    for (rule.recipe) |tok| {
+        if (!std.mem.endsWith(u8, tok, ".a")) continue;
+        const archive = findBundledArchive(tok) orelse {
+            std.debug.print("warning: module '{s}' needs unrecognized archive '{s}', skipping\n", .{ name, tok });
+            return false;
+        };
+        target_mod.addCSourceFiles(.{
+            .root = cpython_dir,
+            .files = Makefile.objsToSources(gpa, mk.get(gpa, archive.objs_var)),
+            .flags = extractIncludePaths(target_mod, b, cpython_dir, gpa, Makefile.tokens(gpa, mk.get(gpa, archive.cflags_var))),
+        });
+    }
+    applyLinkTokens(target_mod, std.mem.join(gpa, " ", rule.recipe) catch @panic("OOM"), overrides);
+
+    return true;
+}
+
+/// Patches `config_c_path`'s content (CPython's own generated
+/// `Modules/config.c` -- produced by `./configure` itself, no `make`/
+/// `makesetup` run needed; see build.zig's top comment), inserting an
+/// `extern PyObject* PyInit_<name>(void);` declaration and a
+/// `{"<name>", PyInit_<name>},` `_PyImport_Inittab` entry for each of
+/// `module_names`, at the `/* -- ADDMODULE MARKER {1,2} -- */` comments
+/// `makesetup` itself would use for exactly this purpose (present in the
+/// file regardless of whether `makesetup` ever actually runs). Returns a
+/// `LazyPath` to the patched copy, written via `b.addWriteFiles()` -- the
+/// original file on disk is left untouched.
+pub fn patchBuiltinModulesConfig(
+    b: *std.Build,
+    gpa: std.mem.Allocator,
+    config_c_path: []const u8,
+    module_names: []const []const u8,
+) std.Build.LazyPath {
+    const original = std.Io.Dir.cwd().readFileAlloc(b.graph.io, config_c_path, gpa, .unlimited) catch |err|
+        std.debug.panic("failed to read {s}: {t}", .{ config_c_path, err });
+
+    var externs: std.ArrayList(u8) = .empty;
+    var entries: std.ArrayList(u8) = .empty;
+    for (module_names) |name| {
+        externs.appendSlice(gpa, b.fmt("extern PyObject* PyInit_{s}(void);\n", .{name})) catch @panic("OOM");
+        entries.appendSlice(gpa, b.fmt("    {{\"{s}\", PyInit_{s}}},\n", .{ name, name })) catch @panic("OOM");
+    }
+
+    const marker1 = "/* -- ADDMODULE MARKER 1 -- */";
+    const marker2 = "/* -- ADDMODULE MARKER 2 -- */";
+    const with_externs = replaceOnce(gpa, original, marker1, b.fmt("{s}\n{s}", .{ externs.items, marker1 })) orelse
+        std.debug.panic("{s}: marker 1 not found -- CPython version drift?", .{config_c_path});
+    const patched = replaceOnce(gpa, with_externs, marker2, b.fmt("{s}\n{s}", .{ entries.items, marker2 })) orelse
+        std.debug.panic("{s}: marker 2 not found -- CPython version drift?", .{config_c_path});
+
+    const wf = b.addWriteFiles();
+    return wf.add("config.c", patched);
+}
+
+fn replaceOnce(gpa: std.mem.Allocator, haystack: []const u8, needle: []const u8, replacement: []const u8) ?[]const u8 {
+    const index = std.mem.indexOf(u8, haystack, needle) orelse return null;
+    return std.mem.concat(gpa, u8, &.{ haystack[0..index], replacement, haystack[index + needle.len ..] }) catch @panic("OOM");
 }

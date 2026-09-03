@@ -58,7 +58,32 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 
     const version = mk.get(gpa, "VERSION"); // e.g. "3.12"
     const ext_suffix = mk.get(gpa, "EXT_SUFFIX"); // e.g. ".cpython-312d-x86_64-linux-gnu.so"
-    const core_cflags = Makefile.tokens(gpa, mk.get(gpa, "PY_CORE_CFLAGS"));
+    // `-Wno-error=date-time`: Zig hands clang `-Werror=date-time` for every optimize
+    // mode but Debug, in the name of reproducible builds. CPython's
+    // `Modules/getbuildinfo.c` expands `__DATE__`/`__TIME__` on purpose -- that is
+    // exactly where `sys.version`'s build timestamp comes from -- so under any release
+    // mode the core library fails to compile at all. Demote it back to a warning
+    // rather than stripping the timestamp: a `python` that can't report when it was
+    // built is a worse artifact than a non-bit-reproducible one.
+    // `-DPLATFORM`/`-DABIFLAGS`: CPython's Makefile gives `Python/getplatform.c` and
+    // `Python/sysmodule.c` their own compile recipes carrying just these two defines
+    // (see the `Python/getplatform.o:` and `Python/sysmodule.o:` rules). Compiling them
+    // with the bulk `PY_CORE_CFLAGS` instead loses both *silently*: `getplatform.c`
+    // falls back to its own `#define PLATFORM "unknown"`, so `sys.platform` reads
+    // `"unknown"` and every `sys.platform`-dispatching library (psutil, and much of
+    // the stdlib) refuses to run; `sysmodule.c`'s `#ifdef ABIFLAGS` block just drops
+    // out, leaving `sys.abiflags` undefined. Added to the shared flags rather than
+    // given per-file recipes: no other core source reads either macro (verified by
+    // grep across `Python/`, `Modules/`, `Objects/` and the public headers), so the
+    // bulk compile stays a single step.
+    const core_cflags = std.mem.concat(gpa, []const u8, &.{
+        Makefile.tokens(gpa, mk.get(gpa, "PY_CORE_CFLAGS")),
+        &[_][]const u8{
+            "-Wno-error=date-time",
+            b.fmt("-DPLATFORM=\"{s}\"", .{mk.get(gpa, "MACHDEP")}),
+            b.fmt("-DABIFLAGS=\"{s}\"", .{mk.get(gpa, "ABIFLAGS")}),
+        },
+    }) catch @panic("OOM");
     const all_core_sources = Utils.fixupSourceExtensions(b, cpython_dir_str, Makefile.objsToSources(gpa, mk.get(gpa, "LIBRARY_OBJS_OMIT_FROZEN")));
     const link_libs = std.mem.concat(gpa, u8, &.{
         mk.get(gpa, "LIBS"), " ", mk.get(gpa, "MODLIBS"), " ", mk.get(gpa, "SYSLIBS"),
@@ -76,6 +101,45 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         core_cflags,
         &[_][]const u8{b.fmt("-DSOABI=\"{s}\"", .{mk.get(gpa, "SOABI")})},
     }) catch @panic("OOM");
+
+    // `-Dstatic-modules=...` (see build/options.zig): confirm each requested name
+    // actually has a build rule *before* generating the `Modules/config.c` patch --
+    // a `PyInit_<name>` extern declared there with nothing compiled to define it is
+    // a link error, not a graceful skip, so the module list going into that patch
+    // must already be pruned to what `Utils.addBuiltinModule` will actually add below.
+    var confirmed_static_modules: std.ArrayList([]const u8) = .empty;
+    for (options.static_modules) |name| {
+        if (mk.findSharedModuleRule(gpa, name) != null) {
+            confirmed_static_modules.append(gpa, name) catch @panic("OOM");
+        } else {
+            std.debug.print("warning: no build rule found for module '{s}' (static-modules), skipping\n", .{name});
+        }
+    }
+    // Only meaningful for `python-linkage=off` (see options.zig's `static_modules`
+    // doc comment): that's the only shape where the final exe's own compilation unit
+    // has the core Python symbols these modules' `PyInit_*` functions need.
+    const use_static_modules = confirmed_static_modules.items.len > 0 and options.python_linkage == null;
+
+    // `Modules/config.c` (CPython's own generated builtin-module table -- produced
+    // by `./configure` alone, not `make`/`makesetup`) is normally part of
+    // `core_sources` verbatim; when using static modules, patch in their
+    // `PyInit_*` externs/inittab entries and compile *that* copy instead, for the
+    // final exe only (freeze_module_exe/bootstrap_exe below are internal build
+    // tools -- the unpatched original is exactly right for them).
+    const config_c_src = "Modules/config.c";
+    var final_core_sources: std.ArrayList([]const u8) = .empty;
+    const patched_config_c: std.Build.LazyPath = if (use_static_modules) blk: {
+        for (all_core_sources) |s| {
+            if (!std.mem.eql(u8, s, config_c_src) and !std.mem.eql(u8, s, dynload_src))
+                final_core_sources.append(gpa, s) catch @panic("OOM");
+        }
+        break :blk Utils.patchBuiltinModulesConfig(
+            b,
+            gpa,
+            b.pathJoin(&.{ cpython_dir_str, config_c_src }),
+            confirmed_static_modules.items,
+        );
+    } else undefined;
 
     // getpath.c is compiled with a blank install prefix everywhere (bootstrap
     // *and* final exe): it makes sys.path discovery relative to argv[0]
@@ -100,7 +164,7 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // to freeze the first 4 bootstrap modules (importlib._bootstrap, etc.) whose
     // headers are required to compile stage 2. Uses getpath_noop.c (a stub) since
     // it doesn't need to discover sys.path -- it just freezes files passed as args.
-    const freeze_module_exe = Utils.addExe(b, cpython_dir, b.graph.host, .Debug, gpa, .{
+    const freeze_module_exe = Utils.addExe(b, cpython_dir, b.graph.host, .Debug, false, gpa, .{
         .name = "freeze_module",
         .core_sources = core_sources.items,
         .core_cflags = core_cflags,
@@ -130,7 +194,7 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // run pure-Python build scripts like Programs/_freeze_module.py (which freezes
     // the remaining ~20 stdlib modules). Not exposed to end users; only exists to
     // bootstrap stage 3.
-    const bootstrap_exe = Utils.addExe(b, cpython_dir, b.graph.host, .Debug, gpa, .{
+    const bootstrap_exe = Utils.addExe(b, cpython_dir, b.graph.host, .Debug, false, gpa, .{
         .name = "_bootstrap_python",
         .core_sources = core_sources.items,
         .core_cflags = core_cflags,
@@ -190,7 +254,7 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     //     actually lets dlopen()'d extensions work under `libc-linkage=static`
     //     (see build/options.zig's python_linkage doc comment for why).
     const final_exe, const libpython_lib = if (options.python_linkage) |python_linkage| blk: {
-        const lib = Utils.addPythonLib(b, cpython_dir, target, optimize, gpa, .{
+        const lib = Utils.addPythonLib(b, cpython_dir, target, optimize, options.strip, gpa, .{
             .name = b.fmt("python{s}", .{version}),
             .core_sources = core_sources.items,
             .core_cflags = core_cflags,
@@ -228,9 +292,9 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         }
         break :blk .{ exe, lib };
     } else blk: {
-        const exe = Utils.addExe(b, cpython_dir, target, optimize, gpa, .{
+        const exe = Utils.addExe(b, cpython_dir, target, optimize, options.strip, gpa, .{
             .name = "python",
-            .core_sources = core_sources.items,
+            .core_sources = if (use_static_modules) final_core_sources.items else core_sources.items,
             .core_cflags = core_cflags,
             .extra_sources = &.{ "Programs/python.c", "Modules/getpath.c", "Python/frozen.c" },
             .extra_flags = getpath_flags,
@@ -240,7 +304,24 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             .linkage = options.libc_linkage,
         });
         exe.root_module.addCSourceFile(.{ .file = deepfreeze_c, .flags = core_cflags });
+        // Patched `Modules/config.c` (extra `PyInit_*`/inittab entries for
+        // `-Dstatic-modules=...`) in place of the one `core_sources` would
+        // otherwise carry -- see the `use_static_modules` block above.
+        if (use_static_modules) {
+            exe.root_module.addCSourceFile(.{ .file = patched_config_c, .flags = core_cflags });
+        }
         exe.rdynamic = true; // -export-dynamic: extension .so's resolve Python C API symbols against us
+        // Static-PIE, not plain static: with `libc-linkage=static`, plain-static +
+        // musl produced a working `dlopen()` symbol table (`_PyImport_DynLoadFiletab`
+        // populated, extension suffixes resolve normally) but every actual `dlopen()`
+        // call itself failed with musl's own `dlerror()` text ("Dynamic loading not
+        // supported" -- confirmed absent from CPython's own source entirely, so it's
+        // musl's libc talking, not ours). musl's static-linked-program `dlopen()`
+        // support is documented to need the executable built as static-PIE
+        // specifically (its self-relocation bootstrap path), not plain static/ET_EXEC
+        // -- this is that experiment. Harmless for `libc-linkage=dynamic` too (most
+        // modern glibc distros already default to PIE for ordinary dynamic exes).
+        exe.pie = true;
         break :blk .{ exe, null };
     };
     // Only a real libpythonX.Y.so (not the .a, and not "off") gives extension
@@ -259,7 +340,16 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // needs them, instead of dynamically linking the host's system `.so`.
     var static_overrides: std.ArrayList(Utils.StaticOverride) = .empty;
     if (options.zlib_linkage == .static) {
-        const zlib_dep = b.dependency("zlib", .{ .target = target, .optimize = optimize });
+        // `pie` (really: PIC) explicitly requested -- needed because this static
+        // archive gets baked into *shared* extension modules (`static_overrides`
+        // below), and Zig's default PIC-ness for a plain static-library compile step
+        // is target-dependent: it works out (PIC-by-default) for `*-linux-gnu`, but
+        // not for `*-linux-musl`, where the resulting object code fails to link into
+        // a `.so` at all ("relocation R_X86_64_64 cannot be used against local
+        // symbol; recompile with -fPIC") -- verified empirically building for
+        // x86_64-linux-musl. Requesting PIC unconditionally is a no-op for targets
+        // that already default to it.
+        const zlib_dep = b.dependency("zlib", .{ .target = target, .optimize = optimize, .pie = true });
         static_overrides.append(gpa, .{ .lib_name = "z", .artifact = zlib_dep.artifact("z") }) catch @panic("OOM");
     }
     if (options.openssl_linkage == .static) {
@@ -280,7 +370,18 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             std.debug.print("skipping module '{s}': dependency linkage is off\n", .{name});
             continue;
         }
-        const lib = Utils.addSharedModule(b, cpython_dir, mk, gpa, target, optimize, common_module_cflags, name, static_overrides.items, dynamic_python_lib) orelse continue;
+        if (use_static_modules and Options.isModuleForcedStatic(options, name)) {
+            // Compiled straight into `final_exe` above (`patched_config_c` already
+            // declares/registers it) instead of as a separate shared module --
+            // `confirmed_static_modules` already guarantees a build rule exists, so
+            // this shouldn't fail, but a `false` here would mean a dangling extern
+            // with nothing defining it, so surface it loudly rather than silently
+            // producing a broken link.
+            if (!Utils.addBuiltinModule(b, cpython_dir, mk, gpa, final_exe.root_module, common_module_cflags, name, static_overrides.items))
+                std.debug.panic("static module '{s}' passed the pre-check but addBuiltinModule failed", .{name});
+            continue;
+        }
+        const lib = Utils.addSharedModule(b, cpython_dir, mk, gpa, target, optimize, options.strip, common_module_cflags, name, static_overrides.items, dynamic_python_lib) orelse continue;
         shared_libs.append(gpa, lib) catch @panic("OOM");
     }
 
