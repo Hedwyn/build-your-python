@@ -18,6 +18,7 @@ const std = @import("std");
 const Makefile = @import("build/makefile.zig");
 const Utils = @import("build/utils.zig");
 const Options = @import("build/options.zig");
+const Sysconfigdata = @import("build/sysconfigdata.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -58,6 +59,22 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 
     const version = mk.get(gpa, "VERSION"); // e.g. "3.12"
     const ext_suffix = mk.get(gpa, "EXT_SUFFIX"); // e.g. ".cpython-312d-x86_64-linux-gnu.so"
+
+    // `_sysconfigdata_<abiflags>_<platform>_<multiarch>.py`: the module
+    // `sysconfig.get_config_vars()`/`get_paths()`/etc. `__import__` at
+    // runtime (see build/sysconfigdata.zig). Derived here from the same
+    // Makefile plus pyconfig.h, instead of shelling out to the built
+    // interpreter, to keep this build's only external dependency Zig itself.
+    const pyconfig_h_path = b.pathJoin(&.{ cpython_dir_str, "pyconfig.h" });
+    const pyconfig_h_text = std.Io.Dir.cwd().readFileAlloc(b.graph.io, pyconfig_h_path, gpa, .unlimited) catch |err|
+        std.debug.panic("failed to read {s}: {t}", .{ pyconfig_h_path, err });
+    var posix_vars = Sysconfigdata.fromMakefile(gpa, mk);
+    Sysconfigdata.mergeConfigH(&posix_vars, pyconfig_h_text);
+    const sysconfigdata_name = Sysconfigdata.moduleName(gpa, mk.get(gpa, "ABIFLAGS"), mk.get(gpa, "MACHDEP"), mk.get(gpa, "MULTIARCH"));
+    const sysconfigdata_file = b.addWriteFiles().add(
+        b.fmt("{s}.py", .{sysconfigdata_name}),
+        Sysconfigdata.render(gpa, posix_vars),
+    );
     // `-Wno-error=date-time`: Zig hands clang `-Werror=date-time` for every optimize
     // mode but Debug, in the name of reproducible builds. CPython's
     // `Modules/getbuildinfo.c` expands `__DATE__`/`__TIME__` on purpose -- that is
@@ -65,23 +82,28 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // mode the core library fails to compile at all. Demote it back to a warning
     // rather than stripping the timestamp: a `python` that can't report when it was
     // built is a worse artifact than a non-bit-reproducible one.
-    // `-DPLATFORM`/`-DABIFLAGS`: CPython's Makefile gives `Python/getplatform.c` and
-    // `Python/sysmodule.c` their own compile recipes carrying just these two defines
+    // `-DPLATFORM`/`-DABIFLAGS`/`-DMULTIARCH`: CPython's Makefile gives `Python/getplatform.c`
+    // and `Python/sysmodule.c` their own compile recipes carrying just these defines
     // (see the `Python/getplatform.o:` and `Python/sysmodule.o:` rules). Compiling them
-    // with the bulk `PY_CORE_CFLAGS` instead loses both *silently*: `getplatform.c`
+    // with the bulk `PY_CORE_CFLAGS` instead loses all three *silently*: `getplatform.c`
     // falls back to its own `#define PLATFORM "unknown"`, so `sys.platform` reads
     // `"unknown"` and every `sys.platform`-dispatching library (psutil, and much of
-    // the stdlib) refuses to run; `sysmodule.c`'s `#ifdef ABIFLAGS` block just drops
-    // out, leaving `sys.abiflags` undefined. Added to the shared flags rather than
-    // given per-file recipes: no other core source reads either macro (verified by
-    // grep across `Python/`, `Modules/`, `Objects/` and the public headers), so the
-    // bulk compile stays a single step.
+    // the stdlib) refuses to run; `sysmodule.c`'s `#ifdef ABIFLAGS`/`#ifdef MULTIARCH`
+    // blocks just drop out, leaving `sys.abiflags` undefined and
+    // `sys.implementation._multiarch` missing -- the latter is what
+    // `sysconfig._get_sysconfigdata_name()` (see build/sysconfigdata.zig) uses to name
+    // the module it imports, so a mismatch there reintroduces the same
+    // `ModuleNotFoundError` this build otherwise fixes. Added to the shared flags rather
+    // than given per-file recipes: no other core source reads any of the three macros
+    // (verified by grep across `Python/`, `Modules/`, `Objects/` and the public headers),
+    // so the bulk compile stays a single step.
     const core_cflags = std.mem.concat(gpa, []const u8, &.{
         Makefile.tokens(gpa, mk.get(gpa, "PY_CORE_CFLAGS")),
         &[_][]const u8{
             "-Wno-error=date-time",
             b.fmt("-DPLATFORM=\"{s}\"", .{mk.get(gpa, "MACHDEP")}),
             b.fmt("-DABIFLAGS=\"{s}\"", .{mk.get(gpa, "ABIFLAGS")}),
+            b.fmt("-DMULTIARCH=\"{s}\"", .{mk.get(gpa, "MULTIARCH")}),
         },
     }) catch @panic("OOM");
     const all_core_sources = Utils.fixupSourceExtensions(b, cpython_dir_str, Makefile.objsToSources(gpa, mk.get(gpa, "LIBRARY_OBJS_OMIT_FROZEN")));
@@ -394,6 +416,11 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         .install_dir = .prefix,
         .install_subdir = lib_dir,
     }).step);
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+        sysconfigdata_file,
+        .prefix,
+        b.fmt("{s}/{s}.py", .{ lib_dir, sysconfigdata_name }),
+    ).step);
     for (shared_libs.items) |lib| {
         const dest = b.fmt("{s}/lib-dynload/{s}{s}", .{ lib_dir, lib.name, ext_suffix });
         b.getInstallStep().dependOn(&b.addInstallFileWithDir(lib.getEmittedBin(), .prefix, dest).step);
