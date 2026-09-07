@@ -19,6 +19,7 @@ const Makefile = @import("build/makefile.zig");
 const Utils = @import("build/utils.zig");
 const Options = @import("build/options.zig");
 const Sysconfigdata = @import("build/sysconfigdata.zig");
+const Pyconfig = @import("build/pyconfig.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -51,6 +52,24 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     const prefix = b.pathJoin(&.{ build_root, "zig-out" });
 
     Utils.runConfigure(b, cpython_dir_str, prefix, target, optimize, options.pyconfig_header);
+
+    // `./configure` isn't cross-aware (see build/utils.zig's runConfigure):
+    // run natively, it misdetects several glibc-only features as available
+    // when `CC` is a musl-targeted `zig cc`. Patch just those macros in
+    // whatever pyconfig.h is now on disk (freshly autoconf-generated, or the
+    // caller's own `-Dpyconfig-header=`) rather than requiring the caller to
+    // know CPython's internals well enough to hand-patch one themselves.
+    // Unconditional on every `build()` call, regardless of whether
+    // `runConfigure` actually reconfigured this time: cheap, and idempotent
+    // -- re-patching an already-patched file converges to the same bytes.
+    if (target.result.abi.isMusl()) {
+        const pyconfig_h_path = b.pathJoin(&.{ cpython_dir_str, "pyconfig.h" });
+        const text = std.Io.Dir.cwd().readFileAlloc(b.graph.io, pyconfig_h_path, gpa, .unlimited) catch |err|
+            std.debug.panic("failed to read {s}: {t} (did ./configure run?)", .{ pyconfig_h_path, err });
+        const patched = Pyconfig.applyPatches(gpa, text, Pyconfig.musl_fixups);
+        std.Io.Dir.cwd().writeFile(b.graph.io, .{ .sub_path = pyconfig_h_path, .data = patched }) catch |err|
+            std.debug.panic("failed to write patched {s}: {t}", .{ pyconfig_h_path, err });
+    }
 
     const makefile_path = b.pathJoin(&.{ cpython_dir_str, "Makefile" });
     const text = std.Io.Dir.cwd().readFileAlloc(b.graph.io, makefile_path, gpa, .unlimited) catch |err|
