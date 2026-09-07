@@ -162,12 +162,23 @@ pub const ExeOptions = struct {
     /// sources #include; each needs its own include path (every freeze Run
     /// step's output lives in its own cache directory).
     frozen_headers: []const std.Build.LazyPath,
-    /// Flags for Python/dynload_shlib.c (needs -DSOABI, which core_cflags lacks).
+    /// Flags for dynload_source (Python/dynload_shlib.c needs -DSOABI, which
+    /// core_cflags lacks; Python/dynload_win.c needs none, but still takes
+    /// core_cflags for its include paths).
     dynload_flags: []const []const u8,
+    /// Platform-specific dynamic-loading source: `Python/dynload_shlib.c`
+    /// (POSIX dlopen()) or `Python/dynload_win.c` (Windows LoadLibrary()) --
+    /// a LazyPath (not just a cpython-root-relative string) so a caller can
+    /// point it at a patched copy instead of the file on disk (see
+    /// build/sourcepatch.zig, used for Windows' dynload_win.c). No default:
+    /// every call site names it explicitly.
+    dynload_source: std.Build.LazyPath,
     /// Whether the executable itself (and the libc it links) is statically
     /// or dynamically linked -- independent of the third-party dependency
     /// StaticOverrides above, which only affect extension `.so`s.
     linkage: std.builtin.LinkMode,
+    /// See addCoreObjects' doc comment. `null` for every POSIX call site.
+    primary_include: ?std.Build.LazyPath = null,
 };
 
 /// Shared setup between `addExe` and `addPythonLib`: include paths, core +
@@ -185,8 +196,17 @@ fn addCoreObjects(
     extra_flags: []const []const u8,
     frozen_headers: []const std.Build.LazyPath,
     dynload_flags: []const []const u8,
+    dynload_source: std.Build.LazyPath,
     link_libs: []const u8,
+    /// Searched (for `#include "..."` quote-form lookups, e.g. `pyconfig.h`)
+    /// *before* `cpython_dir` itself. Windows needs this: its `pyconfig.h`
+    /// lives in `PC/`, not the cpython root, and the root may separately
+    /// hold an autoconf-generated `pyconfig.h` (from configuring the host
+    /// toolchain for the bootstrap tools) that must not shadow it. `null`
+    /// (every POSIX call site) leaves lookup order exactly as before.
+    primary_include: ?std.Build.LazyPath,
 ) void {
+    if (primary_include) |p| mod.addIncludePath(p);
     mod.addIncludePath(cpython_dir);
     mod.addIncludePath(cpython_dir.path(b, "Include"));
     mod.addIncludePath(cpython_dir.path(b, "Include/internal"));
@@ -204,7 +224,7 @@ fn addCoreObjects(
     const resolved_dynload_flags = extractIncludePaths(mod, b, cpython_dir, gpa, dynload_flags);
     mod.addCSourceFiles(.{ .root = cpython_dir, .files = core_sources, .flags = core_flags });
     mod.addCSourceFiles(.{ .root = cpython_dir, .files = extra_sources, .flags = resolved_extra_flags });
-    mod.addCSourceFile(.{ .file = cpython_dir.path(b, "Python/dynload_shlib.c"), .flags = resolved_dynload_flags });
+    mod.addCSourceFile(.{ .file = dynload_source, .flags = resolved_dynload_flags });
     applyLinkTokens(mod, link_libs, &.{});
 }
 
@@ -229,7 +249,9 @@ pub fn addExe(
         opts.extra_flags,
         opts.frozen_headers,
         opts.dynload_flags,
+        opts.dynload_source,
         opts.link_libs,
+        opts.primary_include,
     );
 
     return b.addExecutable(.{ .name = opts.name, .root_module = mod, .linkage = opts.linkage });
@@ -249,6 +271,7 @@ pub const LibPythonOptions = struct {
     link_libs: []const u8,
     frozen_headers: []const std.Build.LazyPath,
     dynload_flags: []const []const u8,
+    dynload_source: std.Build.LazyPath,
     deepfreeze_c: std.Build.LazyPath,
     /// `.static` -> libpythonX.Y.a (still ends up fully absorbed into
     /// whatever links it -- a build-organization split, not a runtime one).
@@ -256,6 +279,8 @@ pub const LibPythonOptions = struct {
     /// extension modules and the shim resolve Python C-API symbols via an
     /// ordinary build-time dependency instead of `-rdynamic`.
     linkage: std.builtin.LinkMode,
+    /// See addCoreObjects' doc comment. `null` for every POSIX call site.
+    primary_include: ?std.Build.LazyPath = null,
 };
 
 pub fn addPythonLib(
@@ -279,7 +304,9 @@ pub fn addPythonLib(
         opts.extra_flags,
         opts.frozen_headers,
         opts.dynload_flags,
+        opts.dynload_source,
         opts.link_libs,
+        opts.primary_include,
     );
     mod.addCSourceFile(.{ .file = opts.deepfreeze_c, .flags = opts.core_cflags });
 

@@ -20,6 +20,8 @@ const Utils = @import("build/utils.zig");
 const Options = @import("build/options.zig");
 const Sysconfigdata = @import("build/sysconfigdata.zig");
 const Pyconfig = @import("build/pyconfig.zig");
+const Vcxproj = @import("build/vcxproj.zig");
+const Sourcepatch = @import("build/sourcepatch.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -32,16 +34,298 @@ pub fn build(b: *std.Build) void {
     }
 }
 
+// Windows build. CPython's own Windows build has no `./configure`/`Makefile`
+// at all -- it's driven by `PCbuild/*.vcxproj` (MSBuild) plus a static,
+// checked-in `PC/pyconfig.h`. See windows.md for the full design writeup;
+// summary of what's different from `buildPosix` below:
+//
+// - No `./configure` for the *target*: `PC/pyconfig.h` is used as-is.
+// - Stage 1/2 (freeze_module, _bootstrap_python) are host-native tools
+//   regardless of target (see buildPosix's own comments -- true there
+//   already for musl cross-builds). For Windows they need a *real* POSIX
+//   pyconfig.h/Makefile pair to compile for the (Linux) build host, entirely
+//   independent of the Windows target -- so `./configure` still runs here,
+//   just targeting `b.graph.host`, not `target`.
+// - Stage 3's source list comes from `PCbuild/pythoncore.vcxproj` (parsed by
+//   build/vcxproj.zig), not a Makefile: Windows statically links most stdlib
+//   C extensions straight into `pythonXY.dll` rather than building each as a
+//   separate shared object the way POSIX does (that's `PC/config.c`'s
+//   inittab, used verbatim -- entries needing an unavailable optional
+//   dependency, e.g. zlib, are already `#ifdef`-guarded out in that file).
+// - The split-lib shape (`pythonXY.dll` + a thin `python.exe` shim) is
+//   mandatory here, not a `python-linkage=dynamic` opt-in like on POSIX:
+//   there's no `-rdynamic` equivalent for a plain `.exe`, so extension
+//   `.pyd`s (once added) need a real import library to link against.
+// - Target triple is mingw-w64 (`*-windows-gnu`), not MSVC ABI: MSVC needs
+//   Microsoft's own SDK/CRT, which Zig doesn't (can't -- proprietary,
+//   non-redistributable) bundle, breaking this project's standalone-toolchain
+//   constraint. Confirmed empirically: `zig cc -target x86_64-windows-msvc`
+//   fails to link libc at all, `x86_64-windows-gnu` works with zero extra
+//   setup. Tradeoff: no ABI compat with official PyPI Windows wheels.
 fn buildWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, options: Options.BuildOptions) void {
-    _ = b;
-    _ = target;
-    _ = optimize;
-    _ = options;
-    @panic(
-        "Windows is not supported yet. CPython builds on Windows via PCBuild/MSBuild " ++
-            "project files, not autotools' configure+make -- that needs its own build " ++
-            "path, not a target flavor of the POSIX one. TODO.",
-    );
+    const gpa = b.allocator;
+    const build_root = b.root.root_dir.path orelse @panic("expected absolute build root path");
+    const cpython_dir_str = b.pathJoin(&.{ build_root, "cpython" });
+    const cpython_dir = b.path("cpython");
+    const prefix = b.pathJoin(&.{ build_root, "zig-out" });
+
+    // ---- host side: configure+build the bootstrap tools natively (Linux),
+    // completely independent of the Windows `target` below.
+    Utils.runConfigure(b, cpython_dir_str, prefix, b.graph.host, .Debug, null);
+
+    const makefile_path = b.pathJoin(&.{ cpython_dir_str, "Makefile" });
+    const makefile_text = std.Io.Dir.cwd().readFileAlloc(b.graph.io, makefile_path, gpa, .unlimited) catch |err|
+        std.debug.panic("failed to read {s}: {t} (did ./configure run?)", .{ makefile_path, err });
+    const mk: Makefile = .{ .text = makefile_text };
+
+    const version = mk.get(gpa, "VERSION"); // e.g. "3.12"
+
+    const host_core_cflags = std.mem.concat(gpa, []const u8, &.{
+        Makefile.tokens(gpa, mk.get(gpa, "PY_CORE_CFLAGS")),
+        &[_][]const u8{"-Wno-error=date-time"}, // see buildPosix's own comment on this flag
+    }) catch @panic("OOM");
+    const host_all_core_sources = Utils.fixupSourceExtensions(b, cpython_dir_str, Makefile.objsToSources(gpa, mk.get(gpa, "LIBRARY_OBJS_OMIT_FROZEN")));
+    const host_link_libs = std.mem.concat(gpa, u8, &.{
+        mk.get(gpa, "LIBS"), " ", mk.get(gpa, "MODLIBS"), " ", mk.get(gpa, "SYSLIBS"),
+    }) catch @panic("OOM");
+    const host_dynload_flags = std.mem.concat(gpa, []const u8, &.{
+        host_core_cflags,
+        &[_][]const u8{b.fmt("-DSOABI=\"{s}\"", .{mk.get(gpa, "SOABI")})},
+    }) catch @panic("OOM");
+    var host_core_sources: std.ArrayList([]const u8) = .empty;
+    for (host_all_core_sources) |s| {
+        if (!std.mem.eql(u8, s, "Python/dynload_shlib.c")) host_core_sources.append(gpa, s) catch @panic("OOM");
+    }
+
+    const freeze_module_exe = Utils.addExe(b, cpython_dir, b.graph.host, .Debug, false, gpa, .{
+        .name = "freeze_module",
+        .core_sources = host_core_sources.items,
+        .core_cflags = host_core_cflags,
+        .extra_sources = &.{ "Programs/_freeze_module.c", "Modules/getpath_noop.c" },
+        .extra_flags = host_core_cflags,
+        .link_libs = host_link_libs,
+        .frozen_headers = &.{},
+        .dynload_flags = host_dynload_flags,
+        .dynload_source = cpython_dir.path(b, "Python/dynload_shlib.c"),
+        .linkage = .dynamic,
+    });
+
+    const freeze_entries = mk.freezeEntries(gpa);
+    var early_headers = std.StringHashMap(std.Build.LazyPath).init(gpa);
+    var early_headers_list: std.ArrayList(std.Build.LazyPath) = .empty;
+    for (freeze_entries) |f| {
+        if (!f.bootstrap) continue;
+        const run = b.addRunArtifact(freeze_module_exe);
+        run.addArg(f.name);
+        run.addFileArg(cpython_dir.path(b, f.src));
+        const out = run.addOutputFileArg(f.out);
+        early_headers.put(f.name, out) catch @panic("OOM");
+        early_headers_list.append(gpa, out) catch @panic("OOM");
+    }
+
+    const host_getpath_flags = std.mem.concat(gpa, []const u8, &.{
+        host_core_cflags,
+        &[_][]const u8{
+            "-DPREFIX=\"\"",
+            "-DEXEC_PREFIX=\"\"",
+            b.fmt("-DVERSION=\"{s}\"", .{version}),
+            "-DPLATLIBDIR=\"lib\"",
+            "-DVPATH=\"\"",
+        },
+    }) catch @panic("OOM");
+
+    const bootstrap_exe = Utils.addExe(b, cpython_dir, b.graph.host, .Debug, false, gpa, .{
+        .name = "_bootstrap_python",
+        .core_sources = host_core_sources.items,
+        .core_cflags = host_core_cflags,
+        .extra_sources = &.{ "Programs/_bootstrap_python.c", "Modules/getpath.c" },
+        .extra_flags = host_getpath_flags,
+        .link_libs = host_link_libs,
+        .frozen_headers = early_headers_list.items,
+        .dynload_flags = host_dynload_flags,
+        .dynload_source = cpython_dir.path(b, "Python/dynload_shlib.c"),
+        .linkage = .dynamic,
+    });
+    const bootstrap_packaged_exe = Utils.packageExe(b, cpython_dir, version, bootstrap_exe);
+
+    var frozen_headers: std.ArrayList(std.Build.LazyPath) = .empty;
+    var deepfreeze_headers: std.ArrayList(std.Build.LazyPath) = .empty;
+    var deepfreeze_names: std.ArrayList([]const u8) = .empty;
+    for (freeze_entries) |f| {
+        const out = if (f.bootstrap) early_headers.get(f.name).? else blk: {
+            const run = std.Build.Step.Run.create(b, b.fmt("freeze {s}", .{f.name}));
+            run.addFileArg(bootstrap_packaged_exe);
+            run.addFileArg(cpython_dir.path(b, "Programs/_freeze_module.py"));
+            run.addArg(f.name);
+            run.addFileArg(cpython_dir.path(b, f.src));
+            break :blk run.addOutputFileArg(f.out);
+        };
+        frozen_headers.append(gpa, out) catch @panic("OOM");
+        if (!std.mem.eql(u8, f.name, "getpath")) {
+            deepfreeze_headers.append(gpa, out) catch @panic("OOM");
+            deepfreeze_names.append(gpa, f.name) catch @panic("OOM");
+        }
+    }
+    const deepfreeze_c = Utils.addDeepfreeze(b, cpython_dir, bootstrap_packaged_exe, deepfreeze_headers.items, deepfreeze_names.items);
+
+    // ---- target side: the real Windows build, sourced from pythoncore.vcxproj.
+    const pythoncore_vcxproj_path = b.pathJoin(&.{ cpython_dir_str, "PCbuild", "pythoncore.vcxproj" });
+    const pythoncore_vcxproj_text = std.Io.Dir.cwd().readFileAlloc(b.graph.io, pythoncore_vcxproj_path, gpa, .unlimited) catch |err|
+        std.debug.panic("failed to read {s}: {t}", .{ pythoncore_vcxproj_path, err });
+    // Python/dynload_win.c is pulled out and added back via `dynload_source`
+    // below, same reason buildPosix pulls Python/dynload_shlib.c out of its
+    // own core_sources (see its comment on `dynload_src`). Modules/zlibmodule.c
+    // is excluded too: its own vendored zlib sources were already dropped by
+    // Vcxproj.sources' `$(zlibDir)` filter, so it'd otherwise be a module with
+    // no zlib to link against -- zlib support is optional/deferred (windows.md).
+    // Modules/_winapi.c is pulled out for the same reason as dynload_win.c:
+    // it needs a build/sourcepatch.zig fixup too (see mingw_fixups), added
+    // back individually below instead of through the bulk core_sources list.
+    // Python/deepfreeze/deepfreeze.c is pythoncore.vcxproj's reference to
+    // CPython's own checked-in, pre-generated copy (for MSVC builds, which
+    // never run our freeze pipeline) -- excluded in favor of the one this
+    // build freshly generates (`deepfreeze_c` below, from *this* build's
+    // actual frozen-module set), same symbols either way so keeping both
+    // is a straight duplicate-symbol link error, not just redundant work.
+    var win_core_sources: std.ArrayList([]const u8) = .empty;
+    for (Vcxproj.sources(gpa, pythoncore_vcxproj_text)) |src| {
+        if (std.mem.eql(u8, src, "Python/dynload_win.c")) continue;
+        if (std.mem.eql(u8, src, "Modules/zlibmodule.c")) continue;
+        if (std.mem.eql(u8, src, "Modules/_winapi.c")) continue;
+        if (std.mem.eql(u8, src, "Python/deepfreeze/deepfreeze.c")) continue;
+        win_core_sources.append(gpa, src) catch @panic("OOM");
+    }
+
+    // Mirrors pythoncore.vcxproj's own `<PreprocessorDefinitions>` (project-wide,
+    // plus getpath.c's per-file block folded in globally -- Python/sysmodule.c
+    // also reads VPATH directly, so it can't be getpath.c-only the way
+    // buildPosix's getpath_flags split assumes). `PLATLIBDIR="DLLs"` and
+    // `PREFIX`/`EXEC_PREFIX`/`VERSION` all `NULL` (not `""`): the literal
+    // values CPython's own Windows build passes for the same relocatable,
+    // argv0-relative landmark-search behavior buildPosix's blank-string
+    // getpath_defines achieve on POSIX.
+    const win_core_cflags = [_][]const u8{
+        "-DPy_BUILD_CORE",
+        "-DPy_BUILD_CORE_BUILTIN",
+        "-DPy_ENABLE_SHARED",
+        "-D_USRDLL",
+        "-DPREFIX=NULL",
+        "-DEXEC_PREFIX=NULL",
+        "-DVERSION=NULL",
+        "-DVPATH=\"\"",
+        "-DPLATLIBDIR=\"DLLs\"",
+        "-Wno-error=date-time",
+        // MSBuild-property-only placeholder (see pythoncore.vcxproj's
+        // `MS_DLL_ID="$(SysWinVer)"`) that PC/dl_nt.c also reads directly as
+        // code, not just from the .rc resource we don't compile. Just a
+        // version-stamp string; blank is harmless.
+        "-DMS_DLL_ID=\"\"",
+        // Normally comes from PCbuild/pyproject.props (shared across every
+        // vcxproj, pythoncore.vcxproj included) as `PY3_DLLNAME=L"$(Py3DllName)"`
+        // -- the stable-ABI forwarder DLL name Python/dynload_win.c looks for
+        // at runtime so it doesn't mistake it for a real Python DLL.
+        "-DPY3_DLLNAME=L\"python3.dll\"",
+        // posixmodule.c compares a `DWORD` (32-bit) against `PY_SSIZE_T_MAX`
+        // (64-bit on this target): always-true, but intentionally so (an
+        // overflow guard that degrades to a no-op on narrower `DWORD`
+        // platforms) -- not a real bug.
+        "-Wno-error=tautological-constant-out-of-range-compare",
+        // posixmodule.c has a couple of `label: int x;`-shaped declarations
+        // immediately after a `case`/goto label -- valid C23, and long-accepted
+        // as a GNU extension on earlier standards; only an error under Clang's
+        // strict pre-C23 pedantic mode.
+        "-Wno-error=c23-extensions",
+        // The next four are all real, benign warnings under Clang (verified
+        // against plain `zig cc`, independent of anything this build adds)
+        // that MSVC simply never flags at all: CPython's Windows sources were
+        // only ever compiled by MSVC, so nothing here forced these to be
+        // written the stricter way. None of them are silencing a mingw-only
+        // problem -- they're generic C laxness MSVC doesn't enforce.
+        "-Wno-error=inconsistent-dllimport", // posixmodule.c's plain `extern char **environ;` vs mingw's dllimport-attributed one
+        // `-Wno-error=` alone doesn't downgrade this one back to a warning in
+        // dynload_win.c's real header-inclusion context (unclear why --
+        // possibly a stricter re-declaration reached through <windows.h>'s
+        // own headers -- verified `-Wno-pointer-sign` outright does), so
+        // disable the warning itself rather than just its error-promotion.
+        "-Wno-pointer-sign", // dynload_win.c's `unsigned char *import_name` passed to str*() (const char *)
+        "-Wno-error=incompatible-pointer-types-discards-qualifiers", // posixmodule.c: wchar_t** where PathCchSkipRoot wants a const-qualified PCWSTR*
+        "-Wno-error=implicit-function-declaration", // posixmodule.c's bare getpid() -- mingw provides it, just not declared in scope here
+        b.fmt("-I{s}", .{b.pathJoin(&.{ cpython_dir_str, "Modules", "_hacl", "include" })}),
+        b.fmt("-I{s}", .{b.pathJoin(&.{ cpython_dir_str, "Modules", "_hacl", "internal" })}),
+        b.fmt("-I{s}", .{b.pathJoin(&.{ cpython_dir_str, "Python" })}),
+    };
+    const pc_dir = cpython_dir.path(b, "PC");
+
+    // build/sourcepatch.zig's mingw_fixups: two narrow, MSVC-tolerated-but-
+    // Clang-rejected lines in CPython's own Windows sources (see windows.md's
+    // "Status" section for the full investigation of each). Applied to
+    // build-time copies only -- the cpython submodule itself is untouched.
+    const dynload_win_patched = Sourcepatch.applyNamed(b, gpa, cpython_dir_str, Sourcepatch.mingw_fixups, "Python/dynload_win.c");
+    const winapi_patched = Sourcepatch.applyNamed(b, gpa, cpython_dir_str, Sourcepatch.mingw_fixups, "Modules/_winapi.c");
+
+    const libpython_lib = Utils.addPythonLib(b, cpython_dir, target, optimize, options.strip, gpa, .{
+        .name = b.fmt("python{s}", .{version}),
+        .core_sources = win_core_sources.items,
+        .core_cflags = &win_core_cflags,
+        .extra_sources = &.{},
+        .extra_flags = &win_core_cflags,
+        // PathCch* (pathcch.lib on MSVC) ships from an API-set DLL, not a
+        // conventionally-named one; mingw-w64 only provides its import lib
+        // under that API-set name.
+        .link_libs = "-lversion -lws2_32 -lapi-ms-win-core-path-l1-1-0 -lbcrypt",
+        .frozen_headers = frozen_headers.items,
+        .dynload_flags = &win_core_cflags,
+        .dynload_source = dynload_win_patched,
+        .deepfreeze_c = deepfreeze_c,
+        .linkage = .dynamic,
+        .primary_include = pc_dir,
+    });
+    const winapi_flags = std.mem.concat(gpa, []const u8, &.{
+        &win_core_cflags,
+        // The patched copy lives in a different directory than the original
+        // (build/sourcepatch.zig writes it under a WriteFiles cache dir), so
+        // its `#include "winreparse.h"` -- a sibling-file quote-include that
+        // resolved fine in-place -- needs Modules/ added back explicitly.
+        &[_][]const u8{b.fmt("-I{s}", .{b.pathJoin(&.{ cpython_dir_str, "Modules" })})},
+    }) catch @panic("OOM");
+    libpython_lib.root_module.addCSourceFile(.{ .file = winapi_patched, .flags = winapi_flags });
+
+    const shim_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+    shim_mod.addIncludePath(pc_dir);
+    shim_mod.addIncludePath(cpython_dir);
+    shim_mod.addIncludePath(cpython_dir.path(b, "Include"));
+    shim_mod.addIncludePath(cpython_dir.path(b, "Include/internal"));
+    shim_mod.addCSourceFile(.{
+        .file = cpython_dir.path(b, "Programs/python.c"),
+        .flags = &.{ "-DPy_BUILD_CORE", "-D_CONSOLE" },
+    });
+    shim_mod.linkLibrary(libpython_lib);
+    const final_exe = b.addExecutable(.{ .name = "python", .root_module = shim_mod, .linkage = options.libc_linkage });
+    // Programs/python.c defines `wmain` (wide-char console entry), not
+    // `main` -- Zig's default CRT-startup-object pick for this target
+    // resolves to mingw's GUI entry (crtexewin.c, wants `WinMain`)
+    // regardless of `.subsystem`. Compile mingw's own console startup
+    // source ourselves instead of relying on that auto-selection: with
+    // UNICODE/_UNICODE defined, its `_tmain` macro (tchar.h) resolves to
+    // `wmain`, and `mainCRTStartup` is the symbol that calls it.
+    final_exe.subsystem = .Console;
+    final_exe.entry = .{ .symbol_name = "mainCRTStartup" };
+    shim_mod.addCSourceFile(.{
+        .file = .{ .cwd_relative = b.pathJoin(&.{ std.fs.path.dirname(b.graph.zig_exe) orelse @panic("zig_exe has no dirname"), "lib", "libc", "mingw", "crt", "crtexe.c" }) },
+        .flags = &.{ "-DUNICODE", "-D_UNICODE", "-DWPRFLAG", "-DUSE_MINGW_ANSI_STDIO=0" },
+    });
+
+    // ---- install: exe + DLL next to each other (Windows DLL search order --
+    // no RPATH/$ORIGIN equivalent), plus Lib/. No lib-dynload/sysconfigdata
+    // step yet: no extension modules, and Windows' sysconfig doesn't read an
+    // imported _sysconfigdata module in the first place (see windows.md).
+    b.getInstallStep().dependOn(&b.addInstallArtifact(final_exe, .{}).step);
+    b.getInstallStep().dependOn(&b.addInstallArtifact(libpython_lib, .{}).step);
+    b.getInstallStep().dependOn(&b.addInstallDirectory(.{
+        .source_dir = cpython_dir.path(b, "Lib"),
+        .install_dir = .prefix,
+        .install_subdir = "Lib",
+    }).step);
 }
 
 fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, options: Options.BuildOptions) void {
@@ -214,6 +498,7 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         .link_libs = link_libs,
         .frozen_headers = &.{},
         .dynload_flags = dynload_flags,
+        .dynload_source = cpython_dir.path(b, "Python/dynload_shlib.c"),
         .linkage = options.libc_linkage,
     });
 
@@ -244,6 +529,7 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         .link_libs = link_libs,
         .frozen_headers = early_headers_list.items,
         .dynload_flags = dynload_flags,
+        .dynload_source = cpython_dir.path(b, "Python/dynload_shlib.c"),
         .linkage = options.libc_linkage,
     });
 
@@ -304,6 +590,7 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             .link_libs = link_libs,
             .frozen_headers = frozen_headers.items,
             .dynload_flags = dynload_flags,
+            .dynload_source = cpython_dir.path(b, "Python/dynload_shlib.c"),
             .deepfreeze_c = deepfreeze_c,
             .linkage = python_linkage,
         });
@@ -342,6 +629,7 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             .link_libs = link_libs,
             .frozen_headers = frozen_headers.items,
             .dynload_flags = dynload_flags,
+            .dynload_source = cpython_dir.path(b, "Python/dynload_shlib.c"),
             .linkage = options.libc_linkage,
         });
         exe.root_module.addCSourceFile(.{ .file = deepfreeze_c, .flags = core_cflags });
