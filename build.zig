@@ -295,25 +295,18 @@ fn buildWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     shim_mod.addIncludePath(cpython_dir);
     shim_mod.addIncludePath(cpython_dir.path(b, "Include"));
     shim_mod.addIncludePath(cpython_dir.path(b, "Include/internal"));
+    // Patched (see mingw_fixups) to define `main` instead of `wmain`: this
+    // Zig version's mingw-w64 integration unconditionally links its own
+    // bundled ANSI crt2.o (expects `main`/`WinMain`) for a windows-gnu exe,
+    // with no exposed way to request the wide-entry CRT variant instead.
+    const python_c_patched = Sourcepatch.applyNamed(b, gpa, cpython_dir_str, Sourcepatch.mingw_fixups, "Programs/python.c");
     shim_mod.addCSourceFile(.{
-        .file = cpython_dir.path(b, "Programs/python.c"),
+        .file = python_c_patched,
         .flags = &.{ "-DPy_BUILD_CORE", "-D_CONSOLE" },
     });
     shim_mod.linkLibrary(libpython_lib);
     const final_exe = b.addExecutable(.{ .name = "python", .root_module = shim_mod, .linkage = options.libc_linkage });
-    // Programs/python.c defines `wmain` (wide-char console entry), not
-    // `main` -- Zig's default CRT-startup-object pick for this target
-    // resolves to mingw's GUI entry (crtexewin.c, wants `WinMain`)
-    // regardless of `.subsystem`. Compile mingw's own console startup
-    // source ourselves instead of relying on that auto-selection: with
-    // UNICODE/_UNICODE defined, its `_tmain` macro (tchar.h) resolves to
-    // `wmain`, and `mainCRTStartup` is the symbol that calls it.
     final_exe.subsystem = .Console;
-    final_exe.entry = .{ .symbol_name = "mainCRTStartup" };
-    shim_mod.addCSourceFile(.{
-        .file = .{ .cwd_relative = b.pathJoin(&.{ std.fs.path.dirname(b.graph.zig_exe) orelse @panic("zig_exe has no dirname"), "lib", "libc", "mingw", "crt", "crtexe.c" }) },
-        .flags = &.{ "-DUNICODE", "-D_UNICODE", "-DWPRFLAG", "-DUSE_MINGW_ANSI_STDIO=0" },
-    });
 
     // ---- install: exe + DLL next to each other (Windows DLL search order --
     // no RPATH/$ORIGIN equivalent), plus Lib/. No lib-dynload/sysconfigdata
