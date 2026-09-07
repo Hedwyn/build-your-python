@@ -58,6 +58,38 @@ pub fn fixupSourceExtensions(b: *std.Build, cpython_dir: []const u8, sources: []
     return sources;
 }
 
+/// Everything that changes what a (re)configure should produce: if any of
+/// this differs from the last successful run recorded in the stamp file (see
+/// below), a fresh `./configure` is needed. Deliberately content-hashed
+/// rather than relying on `Makefile`/`pyconfig.h` file-existence (the
+/// previous check): this function runs eagerly during `build()`, at
+/// graph-construction time, before any `Step` exists -- CPython's module
+/// list is only known once `Makefile` is parsed, so `build()` itself decides
+/// what Steps to create from configure's output, and can't defer that
+/// decision to a `Step.Run`/`addFileInput` the way an ordinary build-time
+/// action would (those only run during the later execution phase). A plain
+/// existence check is also just wrong on its own terms: it treats "Makefile
+/// is present" as "configure inputs haven't changed since", which doesn't
+/// hold across a target/optimize/pyconfig-header change once someone's
+/// deleted stale files by hand expecting a fresh run.
+fn configureFingerprint(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, pyconfig_header: ?[]const u8) [Sha256.digest_length]u8 {
+    var hasher = Sha256.init(.{});
+    hasher.update(target.query.zigTriple(b.allocator) catch @panic("OOM"));
+    hasher.update(&.{0});
+    hasher.update(@tagName(optimize));
+    hasher.update(&.{0});
+    if (pyconfig_header) |src| {
+        const content = std.Io.Dir.cwd().readFileAlloc(b.graph.io, src, b.allocator, .unlimited) catch |err|
+            std.debug.panic("failed to read pyconfig-header {s}: {t}", .{ src, err });
+        hasher.update(content);
+    }
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
 pub fn runConfigure(
     b: *std.Build,
     cpython_dir: []const u8,
@@ -66,8 +98,18 @@ pub fn runConfigure(
     optimize: std.builtin.OptimizeMode,
     pyconfig_header: ?[]const u8,
 ) void {
+    const stamp_path = b.pathJoin(&.{ cpython_dir, ".metapython-configure-stamp" });
+    const fingerprint = configureFingerprint(b, target, optimize, pyconfig_header);
+
     const makefile_path = b.pathJoin(&.{ cpython_dir, "Makefile" });
-    std.Io.Dir.cwd().access(b.graph.io, makefile_path, .{}) catch {
+    const stale = stale: {
+        const prev = std.Io.Dir.cwd().readFileAlloc(b.graph.io, stamp_path, b.allocator, .limited(Sha256.digest_length)) catch
+            break :stale true; // no stamp (first run, or someone deleted it): treat as stale
+        std.Io.Dir.cwd().access(b.graph.io, makefile_path, .{}) catch break :stale true; // stamp present but Makefile missing: also stale
+        break :stale !std.mem.eql(u8, prev, &fingerprint);
+    };
+
+    if (stale) {
         const triple = target.query.zigTriple(b.allocator) catch @panic("OOM");
         const cc = b.fmt("{s} cc -target {s}", .{ b.graph.zig_exe, triple });
         const cxx = b.fmt("{s} c++ -target {s}", .{ b.graph.zig_exe, triple });
@@ -94,16 +136,18 @@ pub fn runConfigure(
             std.debug.print("{s}\n{s}\n", .{ result.stdout, result.stderr });
             std.debug.panic("./configure failed", .{});
         }
-    };
 
-    // Regardless of whether ./configure just ran or was skipped (cached
-    // Makefile from a prior run), a user-supplied pyconfig.h always wins:
-    // overwrite whatever autoconf produced/left behind. Bypasses autoconf's
-    // detection results without needing to skip ./configure -- Makefile is
-    // still required for the makesetup-derived module/object lists.
-    if (pyconfig_header) |src| {
-        std.Io.Dir.cwd().copyFile(src, std.Io.Dir.cwd(), b.pathJoin(&.{ cpython_dir, "pyconfig.h" }), b.graph.io, .{}) catch |err|
-            std.debug.panic("failed to copy pyconfig-header {s}: {t}", .{ src, err });
+        // A user-supplied pyconfig.h always wins: overwrite whatever
+        // autoconf produced. Bypasses autoconf's detection results without
+        // needing to skip ./configure -- Makefile is still required for the
+        // makesetup-derived module/object lists.
+        if (pyconfig_header) |src| {
+            std.Io.Dir.cwd().copyFile(src, std.Io.Dir.cwd(), b.pathJoin(&.{ cpython_dir, "pyconfig.h" }), b.graph.io, .{}) catch |err|
+                std.debug.panic("failed to copy pyconfig-header {s}: {t}", .{ src, err });
+        }
+
+        std.Io.Dir.cwd().writeFile(b.graph.io, .{ .sub_path = stamp_path, .data = &fingerprint }) catch |err|
+            std.debug.panic("failed to write configure stamp {s}: {t}", .{ stamp_path, err });
     }
 }
 
