@@ -82,6 +82,17 @@ pub const BuildOptions = struct {
     /// (see build.zig): that's the only shape where the modules end up in the
     /// same compilation unit as the symbols their `PyInit_*` functions need.
     static_modules: []const []const u8,
+    /// Extension module names to skip entirely (no shared `.so`, no builtin
+    /// -- as if the module didn't exist). Unlike the lib-linkage `off`
+    /// values, this isn't tied to any of the third-party deps this project
+    /// otherwise models: some modules pull in a system lib that's neither
+    /// vendored nor represented as a linkage knob at all (e.g. `_blake2`'s
+    /// `libb2`, `nis`'s `libnsl`/`libtirpc` -- both real on glibc, both
+    /// missing for `-Dtarget=*-linux-musl`; see roadmap.md's "not yet
+    /// triaged" musl module-compile-failure list). Escape hatch for
+    /// exactly that: unblock a target/config where the default module set
+    /// doesn't build, without adding a bespoke linkage option per module.
+    disabled_modules: []const []const u8,
 };
 
 const lib_names = [_][]const u8{
@@ -181,6 +192,18 @@ pub fn parseOptions(b: *std.Build) BuildOptions {
     }
     options.static_modules = static_modules.items;
 
+    const disabled_modules_raw = b.option(
+        []const u8,
+        "disabled-modules",
+        "Comma-separated module names to skip entirely (no .so, no builtin) -- for modules with no linkage knob of their own",
+    ) orelse "";
+    var disabled_modules: std.ArrayList([]const u8) = .empty;
+    var disabled_modules_it = std.mem.splitScalar(u8, disabled_modules_raw, ',');
+    while (disabled_modules_it.next()) |name| {
+        if (name.len > 0) disabled_modules.append(b.allocator, name) catch @panic("OOM");
+    }
+    options.disabled_modules = disabled_modules.items;
+
     if (options.python_linkage == .dynamic and options.libc_linkage == .static)
         std.debug.panic(
             "python-linkage=dynamic requires libc-linkage=dynamic: a statically " ++
@@ -225,14 +248,24 @@ const module_deps = [_]ModuleDeps{
     .{ .linkage_field = "ncurses_linkage", .modules = &.{ "_curses", "_curses_panel" } },
     .{ .linkage_field = "readline_linkage", .modules = &.{"readline"} },
     .{ .linkage_field = "sqlite_linkage", .modules = &.{"_sqlite3"} },
-    .{ .linkage_field = "zlib_linkage", .modules = &.{"zlib"} },
+    // `binascii` also links libz (crc32) alongside the `zlib` module itself
+    // -- see dynlibs.md's "C ext: zlib, binascii" note. Gate both here, not
+    // just `zlib`: `-Dzlib-linkage=off` previously left `binascii` still
+    // demanding a system `libz` that was never provided, failing to compile
+    // regardless of target (confirmed on `-Dtarget=x86_64-linux-musl`, but
+    // the mapping gap isn't musl-specific).
+    .{ .linkage_field = "zlib_linkage", .modules = &.{ "zlib", "binascii" } },
     .{ .linkage_field = "bz2_linkage", .modules = &.{"_bz2"} },
     .{ .linkage_field = "lzma_linkage", .modules = &.{"_lzma"} },
     .{ .linkage_field = "tk_linkage", .modules = &.{"_tkinter"} },
 };
 
-/// True if `name` is a third-party-backed module whose dependency is off (linkage=null).
+/// True if `name` is a third-party-backed module whose dependency is off
+/// (linkage=null), or was named explicitly via `-Ddisabled-modules=...`.
 pub fn isModuleDisabled(options: BuildOptions, name: []const u8) bool {
+    for (options.disabled_modules) |m| {
+        if (std.mem.eql(u8, m, name)) return true;
+    }
     inline for (module_deps) |dep| {
         for (dep.modules) |m| {
             if (std.mem.eql(u8, m, name)) return @field(options, dep.linkage_field) == null;

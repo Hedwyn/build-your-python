@@ -408,7 +408,7 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     for (shared_names) |name| {
         if (Utils.skip_modules.has(name)) continue;
         if (Options.isModuleDisabled(options, name)) {
-            std.debug.print("skipping module '{s}': dependency linkage is off\n", .{name});
+            std.debug.print("skipping module '{s}': dependency linkage is off, or explicitly disabled\n", .{name});
             continue;
         }
         if (use_static_modules and Options.isModuleForcedStatic(options, name)) {
