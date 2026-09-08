@@ -47,6 +47,12 @@ class BuildStep(StrEnum):
 
     INSTALL = "install"
     UNINSTALL = "uninstall"
+    #: Runs `./configure` (and, for a musl target, the automatic pyconfig.h patch)
+    #: only -- no compiling. `./configure` itself takes seconds; it's the *compile*
+    #: `install` goes on to do that costs minutes. Useful when only the resulting
+    #: `<cwd>/cpython/pyconfig.h` is wanted, target-correctly-detected, without
+    #: paying for a full build just to get one.
+    CONFIGURE = "configure"
 
 
 type Library = Literal[

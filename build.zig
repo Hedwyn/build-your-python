@@ -348,6 +348,18 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             std.debug.panic("failed to write patched {s}: {t}", .{ pyconfig_h_path, err });
     }
 
+    // A step with nothing to depend on: `./configure` and the musl patch above already
+    // ran unconditionally, as plain Zig code, before this point is even reached --
+    // regardless of which step ends up actually being requested (every `zig build
+    // <anything>` call runs this whole function to build the step graph first). So
+    // `zig build configure` needs no work of its own to schedule; it exists so a
+    // caller can stop *here*, before any of the compile steps below get constructed
+    // into the graph, for the cost of `./configure` alone (seconds) rather than a
+    // real build (minutes) -- see `BuildOptions.pyconfig_header`'s docs for why a
+    // caller (smelt) wants exactly that: a correctly target-detected pyconfig.h,
+    // without paying for a full compile just to get one.
+    _ = b.step("configure", "Runs ./configure (and the musl pyconfig.h patch above) only -- no compiling.");
+
     const makefile_path = b.pathJoin(&.{ cpython_dir_str, "Makefile" });
     const text = std.Io.Dir.cwd().readFileAlloc(b.graph.io, makefile_path, gpa, .unlimited) catch |err|
         std.debug.panic("failed to read {s}: {t} (did ./configure run?)", .{ makefile_path, err });
