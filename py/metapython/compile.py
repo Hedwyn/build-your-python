@@ -78,6 +78,16 @@ class BuildOptions:
     #: this build's optimize mode), so even a release build emits full DWARF
     #: without this.
     strip: bool | None = None
+    #: Extension module names to compile directly into the main `python`
+    #: executable (a `PyInit_<name>` linked straight in and registered in a
+    #: static `_PyImport_Inittab`) instead of as a `dlopen()`'d `.so`. Only
+    #: meaningful with `python_linkage=Linkage.OFF` (see `build/options.zig`);
+    #: a no-op otherwise.
+    static_modules: tuple[str, ...] = ()
+    #: Extension module names to skip entirely -- no `.so`, no builtin, as if
+    #: the module did not exist. For modules whose system dependency isn't
+    #: modeled by any `libraries` entry (e.g. `_blake2`'s `libb2`).
+    disabled_modules: tuple[str, ...] = ()
 
     def to_args(self) -> list[str]:
         """Render as `zig build` CLI arguments (`-Dname=value`)."""
@@ -96,6 +106,10 @@ class BuildOptions:
             args.append(f"-Dpyconfig-header={self.pyconfig_header}")
         if self.strip is not None:
             args.append(f"-Dstrip={str(self.strip).lower()}")
+        if self.static_modules:
+            args.append(f"-Dstatic-modules={','.join(self.static_modules)}")
+        if self.disabled_modules:
+            args.append(f"-Ddisabled-modules={','.join(self.disabled_modules)}")
         return args
 
 
