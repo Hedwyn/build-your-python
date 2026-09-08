@@ -306,7 +306,7 @@ fn buildWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     });
     shim_mod.linkLibrary(libpython_lib);
     const final_exe = b.addExecutable(.{ .name = "python", .root_module = shim_mod, .linkage = options.libc_linkage });
-    final_exe.subsystem = .Console;
+    final_exe.subsystem = .console;
 
     // ---- install: exe + DLL next to each other (Windows DLL search order --
     // no RPATH/$ORIGIN equivalent), plus Lib/. No lib-dynload/sysconfigdata
