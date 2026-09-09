@@ -53,6 +53,12 @@ class BuildStep(StrEnum):
     #: `<cwd>/cpython/pyconfig.h` is wanted, target-correctly-detected, without
     #: paying for a full build just to get one.
     CONFIGURE = "configure"
+    #: Builds only musl's own loader/libc (`lib/ld-musl-<arch>.so.1`) for a musl
+    #: `-Dtarget`. `install` builds it too whenever `libc_linkage=DYNAMIC` -- an
+    #: interpreter linked that way cannot run without it, since Zig links musl but
+    #: does not ship a musl runtime. Requesting it alone is for consumers that already
+    #: have the interpreter and only need the file to ship next to it.
+    MUSL_LOADER = "musl-loader"
 
 
 type Library = Literal[

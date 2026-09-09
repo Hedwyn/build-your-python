@@ -16,6 +16,16 @@
             .url = "https://github.com/allyourcodebase/libffi/archive/refs/tags/v3.5.2.tar.gz",
             .hash = "libffi-3.5.2-QhHaJyYYAAA1JzdzpVppCdz543jMEJGazBWhRR_FMvRg",
         },
+        // musl's own sources, for building the real ld-musl-<arch>.so.1 a
+        // dynamically-musl-linked interpreter needs at runtime (build/musl.zig).
+        // Lazy: only a musl target ever fetches it. Keep this version in step with
+        // the musl Zig bundles -- they have to agree on the libc ABI the stub Zig
+        // links against.
+        .musl = .{
+            .url = "https://musl.libc.org/releases/musl-1.2.5.tar.gz",
+            .hash = "N-V-__8AAB0gNQAtOCaRIfjFXtrGNrdtTXq5QfQ4TsUCOCUO",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

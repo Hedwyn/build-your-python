@@ -22,6 +22,7 @@ const Sysconfigdata = @import("build/sysconfigdata.zig");
 const Pyconfig = @import("build/pyconfig.zig");
 const Vcxproj = @import("build/vcxproj.zig");
 const Sourcepatch = @import("build/sourcepatch.zig");
+const Musl = @import("build/musl.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -623,7 +624,7 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             // blob as `off`, so extensions still need `-rdynamic` to reach it.
             exe.rdynamic = true;
         }
-        break :blk .{ exe, lib };
+        break :blk .{ exe, @as(?*std.Build.Step.Compile, lib) };
     } else blk: {
         const exe = Utils.addExe(b, cpython_dir, target, optimize, options.strip, gpa, .{
             .name = "python",
@@ -645,18 +646,67 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             exe.root_module.addCSourceFile(.{ .file = patched_config_c, .flags = core_cflags });
         }
         exe.rdynamic = true; // -export-dynamic: extension .so's resolve Python C API symbols against us
-        // Static-PIE, not plain static: with `libc-linkage=static`, plain-static +
-        // musl produced a working `dlopen()` symbol table (`_PyImport_DynLoadFiletab`
-        // populated, extension suffixes resolve normally) but every actual `dlopen()`
-        // call itself failed with musl's own `dlerror()` text ("Dynamic loading not
-        // supported" -- confirmed absent from CPython's own source entirely, so it's
-        // musl's libc talking, not ours). musl's static-linked-program `dlopen()`
-        // support is documented to need the executable built as static-PIE
-        // specifically (its self-relocation bootstrap path), not plain static/ET_EXEC
-        // -- this is that experiment. Harmless for `libc-linkage=dynamic` too (most
-        // modern glibc distros already default to PIE for ordinary dynamic exes).
+        // `exe.pie = true` was originally set here on the hypothesis that musl's
+        // static-linked-program `dlopen()` failure ("Dynamic loading not supported",
+        // musl's own `dlerror()` text -- confirmed absent from CPython's own source
+        // entirely, so it's musl's libc talking, not ours) was a self-relocation
+        // problem plain static/ET_EXEC couldn't solve but static-PIE could. Confirmed
+        // false by direct investigation: Zig's bundled musl port never ships musl's
+        // real ELF loader (`ldso/dynlink.c`) in its static `libc.a` at all --
+        // `ldso/dlopen.c` there is a ~5-line stub that unconditionally calls
+        // `__dl_seterr("Dynamic loading not supported")`, regardless of ET_EXEC vs.
+        // ET_DYN/PIE-ness. A standalone `dlopen()` repro (no CPython involved) hits
+        // the identical stub under `-static`, `-static-pie`, and Zig's own
+        // link-mode-unspecified default alike -- `-static-pie` isn't even honored by
+        // `zig cc`'s driver as a distinct linkage ("argument unused during
+        // compilation"). `libc-linkage=static` therefore can never support `dlopen()`
+        // of a loose `.so`, under any PIE setting: every native module needs to be
+        // either compiled straight in (`-Dstatic-modules=`) or, from the caller's
+        // side, inittab-linked. `exe.pie = true` is kept regardless -- still harmless,
+        // and still what a caller relinking against `libpythonX.Y.a` needs to match
+        // (see build.zig's `off`-branch archive below) -- just no longer believed to
+        // fix dlopen. Keeping `dlopen()` means `libc-linkage=dynamic` instead, which
+        // for a musl target needs a musl runtime to exist on the target machine --
+        // built from musl's own sources and installed into the prefix by
+        // build/musl.zig.
         exe.pie = true;
-        break :blk .{ exe, null };
+
+        // `final_exe` above is self-contained and never needs this -- it's built
+        // fresh here, straight from source, every time. It exists purely so a
+        // downstream caller (smelt's own inittab relink, see roadmap.md's "Known
+        // gaps" #5) can link *additional* object files (its own compiled
+        // extensions) against the same core Python symbols this exe just got,
+        // instead of only being able to do that against a real libpythonX.Y.so --
+        // which `python-linkage=off` never produces. Same translation units as
+        // `final_exe` (core sources, deepfreeze, the patched inittab when
+        // `use_static_modules`), minus `Programs/python.c`'s `main()`, packaged as
+        // an archive instead of linked straight into one binary.
+        const archive = Utils.addPythonLib(b, cpython_dir, target, optimize, options.strip, gpa, .{
+            .name = b.fmt("python{s}", .{version}),
+            .core_sources = if (use_static_modules) final_core_sources.items else core_sources.items,
+            .core_cflags = core_cflags,
+            .extra_sources = &.{ "Modules/getpath.c", "Python/frozen.c" },
+            .extra_flags = getpath_flags,
+            .link_libs = link_libs,
+            .frozen_headers = frozen_headers.items,
+            .dynload_flags = dynload_flags,
+            .dynload_source = cpython_dir.path(b, "Python/dynload_shlib.c"),
+            .deepfreeze_c = deepfreeze_c,
+            .linkage = .static,
+        });
+        if (use_static_modules) {
+            archive.root_module.addCSourceFile(.{ .file = patched_config_c, .flags = core_cflags });
+        }
+        // Whatever links this archive back in (smelt's relink step) produces
+        // another static-PIE exe the same way `final_exe` does -- needs the same
+        // PIC object code `final_exe`'s own compile units get from `exe.pie`.
+        // Zig's default PIC-ness for a plain static-library compile step is
+        // target-dependent (PIC-by-default for `*-linux-gnu`, not for
+        // `*-linux-musl` -- see the `zlib_linkage == .static` comment below for the
+        // same gotcha hit the same way), so this is requested explicitly rather
+        // than relying on the default; harmless where the default already agrees.
+        archive.root_module.pic = true;
+        break :blk .{ exe, @as(?*std.Build.Step.Compile, archive) };
     };
     // Only a real libpythonX.Y.so (not the .a, and not "off") gives extension
     // modules something to link against instead of `-rdynamic`.
@@ -736,5 +786,25 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     for (shared_libs.items) |lib| {
         const dest = b.fmt("{s}/lib-dynload/{s}{s}", .{ lib_dir, lib.name, ext_suffix });
         b.getInstallStep().dependOn(&b.addInstallFileWithDir(lib.getEmittedBin(), .prefix, dest).step);
+    }
+
+    // A musl interpreter linked against libc dynamically has nowhere to get a libc
+    // from: Zig links musl but cannot provide its runtime (see build/musl.zig), and
+    // the target machine is not assumed to have musl installed -- that assumption is
+    // the whole reason to target musl in the first place. So the loader is built from
+    // musl's own sources and installed next to `libpythonX.Y.so`; the interpreter is
+    // only runnable through it. Built for a static-libc build too would be pointless:
+    // there is no dynamic section to satisfy.
+    if (options.libc_linkage == .dynamic) {
+        if (Musl.addLoader(b, target, options.strip)) |loader| {
+            const install = b.addInstallFileWithDir(loader.lib.getEmittedBin(), .lib, loader.install_name);
+            b.getInstallStep().dependOn(&install.step);
+            // Also reachable on its own: the loader is what a consumer needs to ship,
+            // and it is independent of everything else here.
+            b.step(
+                "musl-loader",
+                "Builds musl's ld-musl-<arch>.so.1 (loader + libc) for the musl target only.",
+            ).dependOn(&install.step);
+        }
     }
 }

@@ -29,6 +29,11 @@ pub const BuildOptions = struct {
     /// research.md already flags. See `python_linkage` below for the fix,
     /// and the warning/panic in `parseOptions` for which combinations are
     /// actually allowed.
+    ///
+    /// For a musl target, `dynamic` additionally builds musl's own loader/libc into
+    /// the prefix (`lib/ld-musl-<arch>.so.1`, see build/musl.zig): Zig links musl
+    /// dynamically but ships no musl runtime, so the interpreter is only runnable
+    /// through that file.
     libc_linkage: Linkage,
     /// Whether the core interpreter is built as a standalone library that
     /// the `python` executable and every extension module link against
