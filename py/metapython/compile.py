@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Literal
 
 from . import fetch
+from .pyconfig import MacroPatch
 
 
 class LibCLinkage(Enum):
@@ -83,6 +84,14 @@ class BuildOptions:
     libc_linkage: LibCLinkage | None = None
     python_linkage: Linkage | None = None
     pyconfig_header: Path | None = None
+    #: `pyconfig.h` macro overrides, applied on top of whatever `./configure`
+    #: produced *and* on top of this project's own automatic musl/cross fixups
+    #: (see `metapython.pyconfig`, and `build/pyconfig.zig` for the Zig side
+    #: that actually rewrites the header). Later entries win, so these override
+    #: the built-in fixups rather than the other way round. Lets a caller
+    #: correct a single misdetected macro without hand-maintaining a whole
+    #: `pyconfig_header` file; a name that isn't in the header fails the build.
+    pyconfig_macros: tuple[MacroPatch, ...] = ()
     #: Drop debug info and symbols from every produced artifact at link time.
     #: `None` leaves Zig's own per-optimize-mode default. Not implied by
     #: `optimize`: CPython's `PY_CORE_CFLAGS` carry `-g` unconditionally (they
@@ -116,6 +125,7 @@ class BuildOptions:
             args.append(f"-Dpython-linkage={self.python_linkage.value}")
         if self.pyconfig_header is not None:
             args.append(f"-Dpyconfig-header={self.pyconfig_header}")
+        args.extend(patch.to_arg() for patch in self.pyconfig_macros)
         if self.strip is not None:
             args.append(f"-Dstrip={str(self.strip).lower()}")
         if self.static_modules:

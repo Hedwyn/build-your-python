@@ -2,6 +2,7 @@
 //! passed on the `zig build` command line (e.g. `-Dopenssl-linkage=dynamic`).
 
 const std = @import("std");
+const Pyconfig = @import("pyconfig.zig");
 
 /// static/dynamic linkage of a dependency; same enum std.Build.Step.Compile
 /// uses for its own `.linkage` field (see build/utils.zig's addSharedModule).
@@ -67,6 +68,18 @@ pub const BuildOptions = struct {
     /// autoconf's `HAVE_*`/`ac_cv_*` detection can't execute target-arch test
     /// programs and falls back to conservative (often wrong) guesses.
     pyconfig_header: ?[]const u8,
+    /// Caller-supplied `pyconfig.h` macro overrides, from repeatable
+    /// `-Dpyconfig-define=NAME[=VALUE]` / `-Dpyconfig-undef=NAME` options.
+    ///
+    /// Applied *after* the automatic musl/cross fixup lists (see
+    /// build/pyconfig.zig and their application in build.zig), on whatever
+    /// `pyconfig.h` is on disk at that point -- so a caller can override one
+    /// of those, or patch a macro this project has no opinion about, without
+    /// having to hand-maintain a whole `-Dpyconfig-header=` file (~350
+    /// macros) just to change one line. Panics if a named macro isn't in the
+    /// header at all, so a typo fails the build instead of silently doing
+    /// nothing.
+    pyconfig_macros: []const Pyconfig.MacroPatch,
     /// Extension module names to compile directly into the main `python`
     /// executable (CPython's own "builtin module" mechanism: a `PyInit_<name>`
     /// C function linked straight in and registered in a static
@@ -187,6 +200,23 @@ pub fn parseOptions(b: *std.Build) BuildOptions {
         "pyconfig-header",
         "Path to an existing pyconfig.h to use instead of the one ./configure generates",
     );
+
+    var pyconfig_macros: std.ArrayList(Pyconfig.MacroPatch) = .empty;
+    for (b.option(
+        []const []const u8,
+        "pyconfig-define",
+        "pyconfig.h macro to force on, as NAME=VALUE or bare NAME (repeatable; applied after this project's own musl/cross fixups)",
+    ) orelse &.{}) |spec| {
+        pyconfig_macros.append(b.allocator, Pyconfig.parseDefine(spec)) catch @panic("OOM");
+    }
+    for (b.option(
+        []const []const u8,
+        "pyconfig-undef",
+        "pyconfig.h macro to force off, as a bare NAME (repeatable; applied after this project's own musl/cross fixups)",
+    ) orelse &.{}) |spec| {
+        pyconfig_macros.append(b.allocator, Pyconfig.parseUndef(spec)) catch @panic("OOM");
+    }
+    options.pyconfig_macros = pyconfig_macros.items;
 
     const static_modules_raw = b.option(
         []const u8,

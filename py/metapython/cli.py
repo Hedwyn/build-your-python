@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 from typing import get_args
 
@@ -32,8 +33,12 @@ from .compile import (
     OptimizeMode,
     zig_build,
 )
+from .pyconfig import MacroPatch, parse_define, parse_undef
 
-LIBRARIES = get_args(Library)
+#: `Library` is a PEP695 `type` alias, so it is a `TypeAliasType` rather than
+#: the `Literal[...]` itself -- `get_args` on it returns `()`, silently making
+#: every `--lib NAME=...` unknown. `__value__` is the aliased type.
+LIBRARIES: tuple[Library, ...] = get_args(Library.__value__)
 
 LOG_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")
 
@@ -42,17 +47,41 @@ def _parse_library(value: str) -> tuple[Library, Linkage]:
     name, _, linkage = value.partition("=")
     if not linkage:
         raise click.BadParameter(f"expected NAME=LINKAGE, got {value!r}")
-    if name not in LIBRARIES:
+    # Matched by iteration rather than `name in LIBRARIES` so that what comes
+    # back is the `Library` element itself: `name` is only ever a `str`, and a
+    # membership test doesn't narrow it to the literal type this returns.
+    for library in LIBRARIES:
+        if library == name:
+            break
+    else:
         raise click.BadParameter(
             f"unknown library {name!r}, expected one of {LIBRARIES}"
         )
     try:
-        return name, Linkage(linkage)
+        return library, Linkage(linkage)
     except ValueError:
-        choices = [linkage.value for linkage in Linkage]
+        choices = [member.value for member in Linkage]
         raise click.BadParameter(
             f"unknown linkage {linkage!r}, expected one of {choices}"
         ) from None
+
+
+def _parse_pyconfig_macros(
+    defines: Iterable[str], undefs: Iterable[str]
+) -> tuple[MacroPatch, ...]:
+    """`--pyconfig-define`/`--pyconfig-undef` values as one patch list.
+
+    Defines first, then undefs, so that naming the same macro in both is
+    resolved the way the flag order suggests rather than arbitrarily
+    (`apply_patches` is last-wins).
+    """
+    try:
+        return (
+            *(parse_define(value) for value in defines),
+            *(parse_undef(value) for value in undefs),
+        )
+    except ValueError as error:
+        raise click.BadParameter(str(error)) from None
 
 
 @click.group()
@@ -128,6 +157,22 @@ def fetch(url: str, target: Path | None) -> None:
     help="Bring-your-own pyconfig.h.",
 )
 @click.option(
+    "--pyconfig-define",
+    "pyconfig_defines",
+    multiple=True,
+    metavar="NAME[=VALUE]",
+    help="Force a pyconfig.h macro on, repeatable. Applied after this project's "
+    "own musl/cross fixups, so it overrides them.",
+)
+@click.option(
+    "--pyconfig-undef",
+    "pyconfig_undefs",
+    multiple=True,
+    metavar="NAME",
+    help="Force a pyconfig.h macro off, repeatable. Applied after this project's "
+    "own musl/cross fixups, so it overrides them.",
+)
+@click.option(
     "--step",
     type=click.Choice([step.value for step in BuildStep]),
     default=BuildStep.INSTALL.value,
@@ -153,6 +198,8 @@ def build(
     libc_linkage: str | None,
     python_linkage: str | None,
     pyconfig_header: Path | None,
+    pyconfig_defines: tuple[str, ...],
+    pyconfig_undefs: tuple[str, ...],
     step: str,
     cwd: Path | None,
     zig: Path | None,
@@ -166,6 +213,7 @@ def build(
         libc_linkage=LibCLinkage(libc_linkage) if libc_linkage is not None else None,
         python_linkage=Linkage(python_linkage) if python_linkage is not None else None,
         pyconfig_header=pyconfig_header,
+        pyconfig_macros=_parse_pyconfig_macros(pyconfig_defines, pyconfig_undefs),
     )
     zig_build(
         options,

@@ -345,7 +345,8 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // Panic with an actionable message instead of letting either surface as a
     // confusing downstream compile failure -- see roadmap.md for the full
     // investigation and what unblocking each would take.
-    if (target.result.cpu.arch != b.graph.host.result.cpu.arch) {
+    const cross_arch = target.result.cpu.arch != b.graph.host.result.cpu.arch;
+    if (cross_arch) {
         const host_arch_name = @tagName(b.graph.host.result.cpu.arch);
         const target_arch_name = @tagName(target.result.cpu.arch);
         if (options.openssl_linkage == .static) std.debug.panic(
@@ -364,25 +365,46 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 
     Utils.runConfigure(b, cpython_dir_str, prefix, target, optimize, options);
 
-    // `./configure` isn't cross-aware (see build/utils.zig's runConfigure):
-    // run natively, it misdetects several glibc-only features as available
-    // when `CC` is a musl-targeted `zig cc`. Patch just those macros in
-    // whatever pyconfig.h is now on disk (freshly autoconf-generated, or the
-    // caller's own `-Dpyconfig-header=`) rather than requiring the caller to
-    // know CPython's internals well enough to hand-patch one themselves.
-    // Unconditional on every `build()` call, regardless of whether
-    // `runConfigure` actually reconfigured this time: cheap, and idempotent
-    // -- re-patching an already-patched file converges to the same bytes.
-    if (target.result.abi.isMusl()) {
-        const pyconfig_h_path = b.pathJoin(&.{ cpython_dir_str, "pyconfig.h" });
-        const text = std.Io.Dir.cwd().readFileAlloc(b.graph.io, pyconfig_h_path, gpa, .unlimited) catch |err|
-            std.debug.panic("failed to read {s}: {t} (did ./configure run?)", .{ pyconfig_h_path, err });
-        const patched = Pyconfig.applyPatches(gpa, text, Pyconfig.musl_fixups);
-        std.Io.Dir.cwd().writeFile(b.graph.io, .{ .sub_path = pyconfig_h_path, .data = patched }) catch |err|
-            std.debug.panic("failed to write patched {s}: {t}", .{ pyconfig_h_path, err });
+    // `./configure` gets `pyconfig.h` wrong in two different, independent
+    // ways this project has to correct (see build/pyconfig.zig for the
+    // evidence behind each list, and build/utils.zig's runConfigure for the
+    // two configure modes they correspond to):
+    //  - a musl target on a glibc host is *not* run through `--host` cross
+    //    mode at all (same CPU, so autoconf's own test binaries run fine) --
+    //    which means every libc feature check answers for the host's glibc.
+    //  - a different-CPU target *is*, and then every `AC_RUN_IFELSE` check
+    //    falls back to a hardcoded guess instead of measuring anything.
+    // Patch just the affected macros in whatever pyconfig.h is now on disk
+    // (freshly autoconf-generated, or the caller's own `-Dpyconfig-header=`),
+    // then let `-Dpyconfig-define=`/`-Dpyconfig-undef=` override any of it,
+    // rather than requiring the caller to know CPython's internals well
+    // enough to hand-patch a header themselves. Unconditional on every
+    // `build()` call, regardless of whether `runConfigure` actually
+    // reconfigured this time: cheap, and idempotent -- re-patching an
+    // already-patched file converges to the same bytes.
+    {
+        var patches: std.ArrayList(Pyconfig.MacroPatch) = .empty;
+        if (target.result.abi.isMusl())
+            patches.appendSlice(gpa, Pyconfig.musl_fixups) catch @panic("OOM");
+        if (cross_arch) {
+            patches.appendSlice(gpa, Pyconfig.cross_fixups) catch @panic("OOM");
+            Pyconfig.ArchProfile.of(target.result).appendPatches(gpa, &patches);
+        }
+        // Last, so a caller's explicit request beats this project's defaults
+        // (applyPatches is last-wins on duplicate macro names).
+        patches.appendSlice(gpa, options.pyconfig_macros) catch @panic("OOM");
+
+        if (patches.items.len > 0) {
+            const pyconfig_h_path = b.pathJoin(&.{ cpython_dir_str, "pyconfig.h" });
+            const text = std.Io.Dir.cwd().readFileAlloc(b.graph.io, pyconfig_h_path, gpa, .unlimited) catch |err|
+                std.debug.panic("failed to read {s}: {t} (did ./configure run?)", .{ pyconfig_h_path, err });
+            const patched = Pyconfig.applyPatches(gpa, text, patches.items);
+            std.Io.Dir.cwd().writeFile(b.graph.io, .{ .sub_path = pyconfig_h_path, .data = patched }) catch |err|
+                std.debug.panic("failed to write patched {s}: {t}", .{ pyconfig_h_path, err });
+        }
     }
 
-    // A step with nothing to depend on: `./configure` and the musl patch above already
+    // A step with nothing to depend on: `./configure` and the pyconfig.h patches above already
     // ran unconditionally, as plain Zig code, before this point is even reached --
     // regardless of which step ends up actually being requested (every `zig build
     // <anything>` call runs this whole function to build the step graph first). So
@@ -392,7 +414,7 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // real build (minutes) -- see `BuildOptions.pyconfig_header`'s docs for why a
     // caller (smelt) wants exactly that: a correctly target-detected pyconfig.h,
     // without paying for a full compile just to get one.
-    _ = b.step("configure", "Runs ./configure (and the musl pyconfig.h patch above) only -- no compiling.");
+    _ = b.step("configure", "Runs ./configure (and the pyconfig.h patches above) only -- no compiling.");
 
     const makefile_path = b.pathJoin(&.{ cpython_dir_str, "Makefile" });
     const text = std.Io.Dir.cwd().readFileAlloc(b.graph.io, makefile_path, gpa, .unlimited) catch |err|
