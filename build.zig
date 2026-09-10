@@ -329,6 +329,39 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     const cpython_dir = b.path("cpython");
     const prefix = b.pathJoin(&.{ build_root, "zig-out" });
 
+    // openssl/sqlite3 static linking don't work yet for a genuinely different
+    // CPU architecture than the build machine's own (same-arch targets --
+    // native, or musl-on-glibc -- are unaffected, so this is gated on that
+    // specifically, not on cross-compiling in general):
+    //  - the vendored `allyourcodebase/openssl` package's own build.zig
+    //    unconditionally builds x86_64 inline-asm sources (e.g.
+    //    `crypto/bn/asm/x86_64-gcc.c`) and never generates the ARM-specific
+    //    `arm_arch.h` those sources also need -- verified failing on
+    //    `-Dtarget=aarch64-linux-gnu` with 23 compile errors.
+    //  - `./configure`'s uncached `AC_CHECK_HEADER([sqlite3.h])` probe (see
+    //    build/utils.zig's sqlite3 `LIBSQLITE3_CFLAGS=-I...` cache-var seed)
+    //    fails to find the header under real `--host` cross mode: the `-I`
+    //    path it seeds is captured relative to a cwd that probe doesn't share.
+    // Panic with an actionable message instead of letting either surface as a
+    // confusing downstream compile failure -- see roadmap.md for the full
+    // investigation and what unblocking each would take.
+    if (target.result.cpu.arch != b.graph.host.result.cpu.arch) {
+        const host_arch_name = @tagName(b.graph.host.result.cpu.arch);
+        const target_arch_name = @tagName(target.result.cpu.arch);
+        if (options.openssl_linkage == .static) std.debug.panic(
+            "-Dopenssl-linkage=static is not supported yet when cross-compiling to a " ++
+                "different CPU architecture ({s} host -> {s} target) -- pass " ++
+                "-Dopenssl-linkage=off (or =dynamic, if the target has a system OpenSSL) instead",
+            .{ host_arch_name, target_arch_name },
+        );
+        if (options.sqlite_linkage == .static) std.debug.panic(
+            "-Dsqlite-linkage=static is not supported yet when cross-compiling to a " ++
+                "different CPU architecture ({s} host -> {s} target) -- pass " ++
+                "-Dsqlite-linkage=off (or =dynamic, if the target has a system sqlite3) instead",
+            .{ host_arch_name, target_arch_name },
+        );
+    }
+
     Utils.runConfigure(b, cpython_dir_str, prefix, target, optimize, options);
 
     // `./configure` isn't cross-aware (see build/utils.zig's runConfigure):
