@@ -1,0 +1,15 @@
+.{
+    .name = .lzma,
+    .version = "5.8.4",
+    .fingerprint = 0xe3343e058671d527,
+    .dependencies = .{
+        .xz = .{
+            .url = "https://github.com/tukaani-project/xz/archive/d3e650e63c110e830fd5391e7f8b45df0b91d3da.tar.gz",
+            .hash = "N-V-__8AAJFLZgDEY656l2Qik-3dZKDttx5Z286MKzo2x_OE",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+    },
+}

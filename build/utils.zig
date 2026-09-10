@@ -204,14 +204,28 @@ pub fn runConfigure(
             "ac_cv_lib_sqlite3_sqlite3_value_double=yes",
         }) catch @panic("OOM");
     }
-    // Both bz2's and sqlite3's own `PKG_CHECK_MODULES` calls happily use a *host*
-    // `.pc` file if one is installed, regardless of target -- pkg-config has no
-    // notion of the cross target `CC` is otherwise correctly configured for. Forcing
-    // the cache variable that decides whether a usable `pkg-config` exists at all
-    // (see vendored_libraries_plan.md's `_blake2` section, which diagnosed this same
-    // variable for the same reason) routes both through the fallback branches the
-    // seeds above actually target, on every build host alike.
-    if (options.bz2_linkage == .static or options.sqlite_linkage == .static) {
+    // liblzma's chain (`PKG_CHECK_MODULES([LIBLZMA], [liblzma], [have_liblzma=yes],
+    // [fallback])`) is the same shape as bz2's -- `AC_CHECK_HEADERS([lzma.h])` and
+    // `AC_CHECK_LIB([lzma], [lzma_easy_encoder])` are both ordinary cached checks,
+    // no uncached compile step like sqlite3's version probe, so two cache variables
+    // are enough here too.
+    if (options.lzma_linkage == .static) {
+        cache_vars.appendSlice(b.allocator, &.{
+            "ac_cv_header_lzma_h=yes",
+            "ac_cv_lib_lzma_lzma_easy_encoder=yes",
+        }) catch @panic("OOM");
+    }
+    // bz2's, sqlite3's, and liblzma's own `PKG_CHECK_MODULES` calls happily use a
+    // *host* `.pc` file if one is installed, regardless of target -- pkg-config has
+    // no notion of the cross target `CC` is otherwise correctly configured for
+    // (confirmed: this build host has `bzip2.pc`, `sqlite3.pc`, *and* `liblzma.pc`).
+    // Forcing the cache variable that decides whether a usable `pkg-config` exists at
+    // all (see vendored_libraries_plan.md's `_blake2` section, which diagnosed this
+    // same variable for the same reason) routes all three through the fallback
+    // branches the seeds above actually target, on every build host alike.
+    if (options.bz2_linkage == .static or options.sqlite_linkage == .static or
+        options.lzma_linkage == .static)
+    {
         cache_vars.append(b.allocator, "ac_cv_path_PKG_CONFIG=") catch @panic("OOM");
     }
 

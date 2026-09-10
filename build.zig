@@ -774,6 +774,13 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         bz2_lib.root_module.pic = true;
         static_overrides.append(gpa, .{ .lib_name = "bz2", .artifact = bz2_lib }) catch @panic("OOM");
     }
+    if (options.lzma_linkage == .static) {
+        const lzma_dep = b.dependency("lzma", .{ .target = target, .optimize = optimize });
+        const lzma_lib = lzma_dep.artifact("lzma");
+        // Same PIC requirement as the other static overrides above.
+        lzma_lib.root_module.pic = true;
+        static_overrides.append(gpa, .{ .lib_name = "lzma", .artifact = lzma_lib }) catch @panic("OOM");
+    }
 
     var shared_libs: std.ArrayList(*std.Build.Step.Compile) = .empty;
     for (shared_names) |name| {

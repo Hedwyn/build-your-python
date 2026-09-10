@@ -36,6 +36,12 @@
             .url = "https://github.com/allyourcodebase/bzip2/archive/refs/tags/1.0.8.tar.gz",
             .hash = "bzip2-1.0.8-m7CPz2QGAADdAt97rbHaz6ekIt864HgHs9rZ3fsYF5Fy",
         },
+        // No `allyourcodebase` package exists for liblzma at all (see
+        // vendored_libraries_plan.md) -- own build.zig, wrapping the real
+        // upstream xz source (fetched from a git commit, not a release
+        // tarball: see vendoring/lzma/build.zig's own doc comment on why
+        // that distinction matters for this specific library).
+        .lzma = .{ .path = "vendoring/lzma" },
     },
     .paths = .{
         "build.zig",
