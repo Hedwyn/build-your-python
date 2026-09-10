@@ -99,6 +99,48 @@ fn configureFingerprint(
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
+/// GNU-triple-shaped string `config.sub` accepts -- same spelling Zig's own
+/// triples already use except for 32-bit x86 (`i686`, not `x86`).
+fn gnuArchTriple(b: *std.Build, result: std.Target) []const u8 {
+    return b.fmt("{s}-linux-{s}", .{
+        if (result.cpu.arch == .x86) "i686" else @tagName(result.cpu.arch),
+        @tagName(result.abi),
+    });
+}
+
+/// A stub good enough to satisfy `./configure --with-build-python=`'s own check
+/// (a `command -v` lookup, then one `$path -c "import sys; print(...)"` call to
+/// read back a version string) without an actual, working, host-native CPython
+/// on hand at configure time. Safe here specifically because this project never
+/// runs `make`/`makesetup` afterwards -- the `PYTHON_FOR_BUILD`/`PYTHON_FOR_FREEZE`
+/// Make variables this option feeds are only read by Makefile recipes we never
+/// invoke (see build.zig's own 3-stage bootstrap, which freezes modules through
+/// its own host-native `freeze_module`/`_bootstrap_python` Zig steps instead).
+/// Version is read out of `./configure` itself (`PACKAGE_VERSION='X.Y'`) rather
+/// than hardcoded, so a submodule bump can't silently desync the two.
+fn writeBuildPythonStub(b: *std.Build, cpython_dir: []const u8) []const u8 {
+    const gpa = b.allocator;
+    const configure_path = b.pathJoin(&.{ cpython_dir, "configure" });
+    const configure_text = std.Io.Dir.cwd().readFileAlloc(b.graph.io, configure_path, gpa, .unlimited) catch |err|
+        std.debug.panic("failed to read {s}: {t}", .{ configure_path, err });
+    const needle = "\nPACKAGE_VERSION='";
+    const start = std.mem.indexOf(u8, configure_text, needle) orelse
+        std.debug.panic("PACKAGE_VERSION not found in {s}", .{configure_path});
+    const rest = configure_text[start + needle.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '\'') orelse
+        std.debug.panic("malformed PACKAGE_VERSION in {s}", .{configure_path});
+    const version = rest[0..end];
+
+    const stub_path = b.pathJoin(&.{ cpython_dir, ".metapython-build-python-stub.sh" });
+    std.Io.Dir.cwd().writeFile(b.graph.io, .{
+        .sub_path = stub_path,
+        .data = b.fmt("#!/bin/sh\necho {s}\n", .{version}),
+    }) catch |err| std.debug.panic("failed to write {s}: {t}", .{ stub_path, err });
+    std.Io.Dir.cwd().setFilePermissions(b.graph.io, stub_path, .executable_file, .{}) catch |err|
+        std.debug.panic("failed to chmod {s}: {t}", .{ stub_path, err });
+    return stub_path;
+}
+
 pub fn runConfigure(
     b: *std.Build,
     cpython_dir: []const u8,
@@ -114,28 +156,50 @@ pub fn runConfigure(
     const ar = b.fmt("{s} ar", .{b.graph.zig_exe});
     const ranlib = b.fmt("{s} ranlib", .{b.graph.zig_exe});
 
+    const host_result = b.graph.host.result;
+    // A different CPU architecture than the build machine's own is the one case
+    // plain, `--host`-less `./configure` cannot paper over: `AC_PROG_CC`'s very
+    // first sanity check compiles a trivial program and *executes* it to learn
+    // whether it's cross-compiling -- which works by accident for a same-arch,
+    // different-libc target (a musl binary still runs fine on a glibc kernel)
+    // but is a hard "cannot run C compiled programs" abort for e.g. an aarch64
+    // binary on an x86_64 host, before configure produces anything at all. Real
+    // `--host=`/`--build=` cross mode is the only way past that -- see below for
+    // what entering it then additionally requires.
+    const cross_arch = target.result.cpu.arch != host_result.cpu.arch;
+
     // `--build` for a musl target, and only for the sake of one decision.
     // CPython's configure derives its platform triplet from a *preprocessor* test
     // -- which cannot tell musl from glibc, since musl deliberately defines no
     // macro of its own -- and then rewrites `linux-gnu` to `linux-musl` only if
     // `$build_os` says musl. `$build_os` is the machine autoconf thinks it is
-    // running on, so without this a musl build is indistinguishable from a native
-    // glibc one and comes out claiming `SOABI=cpython-3xx-<arch>-linux-gnu`. That
-    // name is not cosmetic: it is the `EXT_SUFFIX` every extension module is named
-    // after and the one the import system looks for, so a `musllinux` wheel (whose
-    // `.so` is named `...-linux-musl.so`) would be invisible to the interpreter.
+    // running on (and, notably, still what this checks even under real `--host`
+    // cross mode below -- config.sub's musl relabeling reads `$build_os`, never
+    // `$host_os`), so without this a musl build is indistinguishable from a
+    // native glibc one and comes out claiming `SOABI=cpython-3xx-<arch>-linux-gnu`.
+    // That name is not cosmetic: it is the `EXT_SUFFIX` every extension module is
+    // named after and the one the import system looks for, so a `musllinux` wheel
+    // (whose `.so` is named `...-linux-musl.so`) would be invisible to the
+    // interpreter. Spelled with the *host's* own arch, not the target's: this is
+    // a lie about `$build_os`'s libc only -- its architecture is supposed to
+    // describe the real build machine truthfully, cross_arch or not.
     //
-    // It is the only thing `$build_os` decides in the whole script, and `--host`
-    // is deliberately still not passed: this build has always run configure's
-    // probes natively and patched what they get wrong afterwards (see
-    // build/pyconfig.zig), rather than entering autoconf's cross-compilation mode.
+    // Under real `--host` cross mode (`cross_arch`, below), `--build=` also
+    // stops being optional for an unrelated reason: this configure.ac treats a
+    // `--host` given without an explicit `--build` as ambiguous
+    // (`cross_compiling=maybe`) and refuses outright ("Cross compiling required
+    // --host=HOST-TUPLE and --build=ARCH") rather than falling back to
+    // `config.guess`. A non-musl cross-arch target therefore still needs a
+    // `--build=`, just an honest one (no libc lie needed).
     const build_triple: ?[]const u8 = if (target.result.abi.isMusl())
         b.fmt("--build={s}-linux-{s}", .{
             // `config.sub` speaks GNU architecture names, which are Zig's own but for
             // the 32-bit x86 spelling.
-            if (target.result.cpu.arch == .x86) "i686" else @tagName(target.result.cpu.arch),
+            if (host_result.cpu.arch == .x86) "i686" else @tagName(host_result.cpu.arch),
             @tagName(target.result.abi),
         })
+    else if (cross_arch)
+        b.fmt("--build={s}", .{gnuArchTriple(b, host_result)})
     else
         null;
 
@@ -229,6 +293,26 @@ pub fn runConfigure(
         cache_vars.append(b.allocator, "ac_cv_path_PKG_CONFIG=") catch @panic("OOM");
     }
 
+    // Real `--host` cross mode (see `cross_arch` above) makes CPython's own
+    // configure.ac answer nearly every feature check from its own built-in,
+    // documented cross-compiling defaults -- verified empirically for
+    // `aarch64-linux-gnu`: only these three have no such default and abort
+    // outright asking for a cache variable (or, for getaddrinfo, a
+    // `--disable-ipv6` fallback this project doesn't want) instead:
+    //  - `getaddrinfo bug`: an `AC_TRY_RUN` with no cross branch at all: this
+    //    project targets modern glibc/musl, neither of which has the bug the
+    //    check exists for.
+    //  - `/dev/ptmx`, `/dev/ptc`: file-existence checks configure explicitly
+    //    refuses to guess when cross-compiling. Linux always has the former,
+    //    never the latter (a BSD/macOS-only pty device).
+    if (cross_arch) {
+        cache_vars.appendSlice(b.allocator, &.{
+            "ac_cv_buggy_getaddrinfo=no",
+            "ac_cv_file__dev_ptmx=yes",
+            "ac_cv_file__dev_ptc=no",
+        }) catch @panic("OOM");
+    }
+
     var argv_list: std.ArrayList([]const u8) = .empty;
     argv_list.appendSlice(b.allocator, &.{
         "./configure",
@@ -243,6 +327,12 @@ pub fn runConfigure(
         },
     }) catch @panic("OOM");
     if (build_triple) |entry| argv_list.append(b.allocator, entry) catch @panic("OOM");
+    if (cross_arch) {
+        argv_list.appendSlice(b.allocator, &.{
+            b.fmt("--host={s}", .{gnuArchTriple(b, target.result)}),
+            b.fmt("--with-build-python={s}", .{writeBuildPythonStub(b, cpython_dir)}),
+        }) catch @panic("OOM");
+    }
     argv_list.appendSlice(b.allocator, cache_vars.items) catch @panic("OOM");
     const argv = argv_list.items;
 
