@@ -1,0 +1,15 @@
+.{
+    .name = .sqlite3,
+    .version = "3.53.2",
+    .fingerprint = 0x6edcd711b1896450,
+    .dependencies = .{
+        .sqlite3 = .{
+            .url = "https://sqlite.org/2026/sqlite-amalgamation-3530200.zip",
+            .hash = "N-V-__8AALc_rgC04POe18O0LKFRm4ouQpLtL3riscEmWp-Q",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+    },
+}

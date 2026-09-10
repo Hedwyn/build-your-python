@@ -759,6 +759,21 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         libffi_lib.root_module.pic = true;
         static_overrides.append(gpa, .{ .lib_name = "ffi", .artifact = libffi_lib }) catch @panic("OOM");
     }
+    if (options.sqlite_linkage == .static) {
+        const sqlite3_dep = b.dependency("sqlite3", .{ .target = target, .optimize = optimize });
+        const sqlite3_lib = sqlite3_dep.artifact("sqlite3");
+        // Same PIC requirement as libffi/openssl above: `_sqlite3` is a shared
+        // module, and this package's own build.zig sets no PIC option of its own.
+        sqlite3_lib.root_module.pic = true;
+        static_overrides.append(gpa, .{ .lib_name = "sqlite3", .artifact = sqlite3_lib }) catch @panic("OOM");
+    }
+    if (options.bz2_linkage == .static) {
+        const bz2_dep = b.dependency("bzip2", .{ .target = target, .optimize = optimize });
+        const bz2_lib = bz2_dep.artifact("bz"); // package's own artifact name, not "bz2"
+        // Same PIC requirement as libffi/openssl/sqlite3 above.
+        bz2_lib.root_module.pic = true;
+        static_overrides.append(gpa, .{ .lib_name = "bz2", .artifact = bz2_lib }) catch @panic("OOM");
+    }
 
     var shared_libs: std.ArrayList(*std.Build.Step.Compile) = .empty;
     for (shared_names) |name| {

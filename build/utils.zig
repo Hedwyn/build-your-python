@@ -156,6 +156,64 @@ pub fn runConfigure(
             "ac_cv_working_openssl_hashlib=yes",
         }) catch @panic("OOM");
     }
+    // bz2's detection chain (`PKG_CHECK_MODULES([BZIP2], [bzip2], [have_bzip2=yes],
+    // [fallback])`) is fully cache-var-bypassable: both the header presence check
+    // (`AC_CHECK_HEADERS([bzlib.h])`) and the symbol check
+    // (`AC_CHECK_LIB([bz2], [BZ2_bzCompress])`) are ordinary `AC_CACHE_CHECK`-family
+    // macros, so seeding their two cache variables is enough -- no real header or
+    // library needs to exist yet. But the *outer* `PKG_CHECK_MODULES` only reaches
+    // that fallback if pkg-config doesn't already claim success on its own account,
+    // which it will on any host that happens to have a `bzip2.pc` installed (this
+    // build host does) -- see the `ac_cv_path_PKG_CONFIG` seed below for why that
+    // path is closed off unconditionally whenever either of these is vendored.
+    if (options.bz2_linkage == .static) {
+        cache_vars.appendSlice(b.allocator, &.{
+            "ac_cv_header_bzlib_h=yes",
+            "ac_cv_lib_bz2_BZ2_bzCompress=yes",
+        }) catch @panic("OOM");
+    }
+    // sqlite3's chain has one link bz2's doesn't: the version-number check
+    // (`#if SQLITE_VERSION_NUMBER < 3007015`) is a raw, uncached `AC_COMPILE_IFELSE`
+    // inside `AC_CHECK_HEADER([sqlite3.h])`'s action -- there is no cache variable
+    // for it, so unlike every other check here it cannot be bypassed and a real
+    // `sqlite3.h` must be reachable when `./configure` runs. Fetching the same
+    // amalgamation the `sqlite3` Zig package itself depends on (rather than
+    // hardcoding a second copy of the URL/hash in this project's own
+    // `build.zig.zon`) keeps the two in lockstep automatically. The nine
+    // `PY_CHECK_SQLITE_FUNC`-driven `AC_CHECK_LIB` capability checks that follow
+    // *are* ordinary cached checks, so those are bypassed the same way bz2's is --
+    // a real link test would fail anyway, since no compiled `libsqlite3.a` exists
+    // at `./configure` time (the Zig artifact is only built later, during the
+    // actual `zig build` compile phase).
+    if (options.sqlite_linkage == .static) {
+        const sqlite3_dep = b.dependency("sqlite3", .{ .target = target, .optimize = optimize });
+        const sqlite3_src = sqlite3_dep.builder.dependency("sqlite3", .{});
+        const sqlite3_src_dir = sqlite3_src.builder.root.root_dir.path orelse
+            std.debug.panic("expected absolute sqlite3 dependency root path", .{});
+        cache_vars.appendSlice(b.allocator, &.{
+            b.fmt("LIBSQLITE3_CFLAGS=-I{s}", .{sqlite3_src_dir}),
+            "LIBSQLITE3_LIBS=-lsqlite3",
+            "ac_cv_lib_sqlite3_sqlite3_bind_double=yes",
+            "ac_cv_lib_sqlite3_sqlite3_column_decltype=yes",
+            "ac_cv_lib_sqlite3_sqlite3_column_double=yes",
+            "ac_cv_lib_sqlite3_sqlite3_complete=yes",
+            "ac_cv_lib_sqlite3_sqlite3_progress_handler=yes",
+            "ac_cv_lib_sqlite3_sqlite3_result_double=yes",
+            "ac_cv_lib_sqlite3_sqlite3_set_authorizer=yes",
+            "ac_cv_lib_sqlite3_sqlite3_trace_v2=yes",
+            "ac_cv_lib_sqlite3_sqlite3_value_double=yes",
+        }) catch @panic("OOM");
+    }
+    // Both bz2's and sqlite3's own `PKG_CHECK_MODULES` calls happily use a *host*
+    // `.pc` file if one is installed, regardless of target -- pkg-config has no
+    // notion of the cross target `CC` is otherwise correctly configured for. Forcing
+    // the cache variable that decides whether a usable `pkg-config` exists at all
+    // (see vendored_libraries_plan.md's `_blake2` section, which diagnosed this same
+    // variable for the same reason) routes both through the fallback branches the
+    // seeds above actually target, on every build host alike.
+    if (options.bz2_linkage == .static or options.sqlite_linkage == .static) {
+        cache_vars.append(b.allocator, "ac_cv_path_PKG_CONFIG=") catch @panic("OOM");
+    }
 
     var argv_list: std.ArrayList([]const u8) = .empty;
     argv_list.appendSlice(b.allocator, &.{

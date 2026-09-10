@@ -125,7 +125,7 @@ fn parseRequiredLinkage(raw: []const u8) Linkage {
 /// Libs that can actually be built from source and statically linked in.
 /// Everything else in `lib_names` still only supports "dynamic"/"off".
 const static_implemented = std.StaticStringMap(void).initComptime(.{
-    .{"zlib"}, .{"openssl"}, .{"libffi"},
+    .{"zlib"}, .{"openssl"}, .{"libffi"}, .{"sqlite"}, .{"bz2"},
 });
 
 /// Default linkage per lib: mirrors python-build-standalone (pbs, what `uv`
@@ -139,6 +139,8 @@ const default_overrides = std.StaticStringMap([]const u8).initComptime(.{
     .{ "zlib", "static" },
     .{ "openssl", "static" },
     .{ "libffi", "static" },
+    .{ "sqlite", "static" },
+    .{ "bz2", "static" },
 });
 
 /// Reads `-D{lib}-linkage=...` for every third-party dependency (see
