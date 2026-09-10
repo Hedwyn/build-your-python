@@ -3,6 +3,7 @@
 //! that aren't part of the top-level build orchestration.
 
 const std = @import("std");
+const Options = @import("options.zig");
 const Makefile = @import("makefile.zig");
 
 pub const BundledArchive = struct {
@@ -58,9 +59,13 @@ pub fn fixupSourceExtensions(b: *std.Build, cpython_dir: []const u8, sources: []
     return sources;
 }
 
-/// Everything that changes what a (re)configure should produce: if any of
-/// this differs from the last successful run recorded in the stamp file (see
-/// below), a fresh `./configure` is needed. Deliberately content-hashed
+/// Everything that changes what a (re)configure should produce -- the command line it
+/// would be run with, plus the caller's own `pyconfig.h` if there is one: if any of
+/// this differs from the last successful run recorded in the stamp file (see below), a
+/// fresh `./configure` is needed. Hashing the command itself rather than the inputs it
+/// was derived from means a change in *how* it is composed (a flag added for a class
+/// of target, say) invalidates the stamp on its own, with nothing to remember to
+/// update here. Deliberately content-hashed
 /// rather than relying on `Makefile`/`pyconfig.h` file-existence (the
 /// previous check): this function runs eagerly during `build()`, at
 /// graph-construction time, before any `Step` exists -- CPython's module
@@ -72,12 +77,16 @@ pub fn fixupSourceExtensions(b: *std.Build, cpython_dir: []const u8, sources: []
 /// is present" as "configure inputs haven't changed since", which doesn't
 /// hold across a target/optimize/pyconfig-header change once someone's
 /// deleted stale files by hand expecting a fresh run.
-fn configureFingerprint(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, pyconfig_header: ?[]const u8) [Sha256.digest_length]u8 {
+fn configureFingerprint(
+    b: *std.Build,
+    argv: []const []const u8,
+    pyconfig_header: ?[]const u8,
+) [Sha256.digest_length]u8 {
     var hasher = Sha256.init(.{});
-    hasher.update(target.query.zigTriple(b.allocator) catch @panic("OOM"));
-    hasher.update(&.{0});
-    hasher.update(@tagName(optimize));
-    hasher.update(&.{0});
+    for (argv) |arg| {
+        hasher.update(arg);
+        hasher.update(&.{0});
+    }
     if (pyconfig_header) |src| {
         const content = std.Io.Dir.cwd().readFileAlloc(b.graph.io, src, b.allocator, .unlimited) catch |err|
             std.debug.panic("failed to read pyconfig-header {s}: {t}", .{ src, err });
@@ -96,11 +105,77 @@ pub fn runConfigure(
     prefix: []const u8,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    pyconfig_header: ?[]const u8,
+    options: Options.BuildOptions,
 ) void {
-    const stamp_path = b.pathJoin(&.{ cpython_dir, ".metapython-configure-stamp" });
-    const fingerprint = configureFingerprint(b, target, optimize, pyconfig_header);
+    const pyconfig_header = options.pyconfig_header;
+    const triple = target.query.zigTriple(b.allocator) catch @panic("OOM");
+    const cc = b.fmt("{s} cc -target {s}", .{ b.graph.zig_exe, triple });
+    const cxx = b.fmt("{s} c++ -target {s}", .{ b.graph.zig_exe, triple });
+    const ar = b.fmt("{s} ar", .{b.graph.zig_exe});
+    const ranlib = b.fmt("{s} ranlib", .{b.graph.zig_exe});
 
+    // `--build` for a musl target, and only for the sake of one decision.
+    // CPython's configure derives its platform triplet from a *preprocessor* test
+    // -- which cannot tell musl from glibc, since musl deliberately defines no
+    // macro of its own -- and then rewrites `linux-gnu` to `linux-musl` only if
+    // `$build_os` says musl. `$build_os` is the machine autoconf thinks it is
+    // running on, so without this a musl build is indistinguishable from a native
+    // glibc one and comes out claiming `SOABI=cpython-3xx-<arch>-linux-gnu`. That
+    // name is not cosmetic: it is the `EXT_SUFFIX` every extension module is named
+    // after and the one the import system looks for, so a `musllinux` wheel (whose
+    // `.so` is named `...-linux-musl.so`) would be invisible to the interpreter.
+    //
+    // It is the only thing `$build_os` decides in the whole script, and `--host`
+    // is deliberately still not passed: this build has always run configure's
+    // probes natively and patched what they get wrong afterwards (see
+    // build/pyconfig.zig), rather than entering autoconf's cross-compilation mode.
+    const build_triple: ?[]const u8 = if (target.result.abi.isMusl())
+        b.fmt("--build={s}-linux-{s}", .{
+            // `config.sub` speaks GNU architecture names, which are Zig's own but for
+            // the 32-bit x86 spelling.
+            if (target.result.cpu.arch == .x86) "i686" else @tagName(target.result.cpu.arch),
+            @tagName(target.result.abi),
+        })
+    else
+        null;
+
+    // Which optional modules exist at all is `configure`'s call, and it makes it by
+    // probing *this* machine -- which is the wrong question for every library this
+    // project vendors and builds from source for the target. OpenSSL is where it
+    // shows: the probe link-tests the host's `libssl` with a target-targeting
+    // compiler, fails for anything but a native build, and leaves `_ssl`/`_hashlib`
+    // out of `MODSHARED_NAMES` entirely -- so no amount of `-Dopenssl-linkage=static`
+    // downstream can bring them back, because the Makefile carries no rule to build
+    // them. Pre-seeding autoconf's own cache variables is the documented way to answer
+    // a question the build machine cannot: the answer here is "yes, and the library
+    // comes from us".
+    var cache_vars: std.ArrayList([]const u8) = .empty;
+    if (options.openssl_linkage == .static) {
+        cache_vars.appendSlice(b.allocator, &.{
+            "ac_cv_working_openssl_ssl=yes",
+            "ac_cv_working_openssl_hashlib=yes",
+        }) catch @panic("OOM");
+    }
+
+    var argv_list: std.ArrayList([]const u8) = .empty;
+    argv_list.appendSlice(b.allocator, &.{
+        "./configure",
+        b.fmt("--prefix={s}", .{prefix}),
+        b.fmt("CC={s}", .{cc}),
+        b.fmt("CXX={s}", .{cxx}),
+        b.fmt("AR={s}", .{ar}),
+        b.fmt("RANLIB={s}", .{ranlib}),
+        switch (optimize) {
+            .Debug => "--with-pydebug",
+            .ReleaseFast, .ReleaseSmall, .ReleaseSafe => "--enable-optimizations",
+        },
+    }) catch @panic("OOM");
+    if (build_triple) |entry| argv_list.append(b.allocator, entry) catch @panic("OOM");
+    argv_list.appendSlice(b.allocator, cache_vars.items) catch @panic("OOM");
+    const argv = argv_list.items;
+
+    const stamp_path = b.pathJoin(&.{ cpython_dir, ".metapython-configure-stamp" });
+    const fingerprint = configureFingerprint(b, argv, pyconfig_header);
     const makefile_path = b.pathJoin(&.{ cpython_dir, "Makefile" });
     const stale = stale: {
         const prev = std.Io.Dir.cwd().readFileAlloc(b.graph.io, stamp_path, b.allocator, .limited(Sha256.digest_length)) catch
@@ -110,26 +185,8 @@ pub fn runConfigure(
     };
 
     if (stale) {
-        const triple = target.query.zigTriple(b.allocator) catch @panic("OOM");
-        const cc = b.fmt("{s} cc -target {s}", .{ b.graph.zig_exe, triple });
-        const cxx = b.fmt("{s} c++ -target {s}", .{ b.graph.zig_exe, triple });
-        const ar = b.fmt("{s} ar", .{b.graph.zig_exe});
-        const ranlib = b.fmt("{s} ranlib", .{b.graph.zig_exe});
-
-        const argv = [_][]const u8{
-            "./configure",
-            b.fmt("--prefix={s}", .{prefix}),
-            b.fmt("CC={s}", .{cc}),
-            b.fmt("CXX={s}", .{cxx}),
-            b.fmt("AR={s}", .{ar}),
-            b.fmt("RANLIB={s}", .{ranlib}),
-            switch (optimize) {
-                .Debug => "--with-pydebug",
-                .ReleaseFast, .ReleaseSmall, .ReleaseSafe => "--enable-optimizations",
-            },
-        };
         const result = std.process.run(b.allocator, b.graph.io, .{
-            .argv = &argv,
+            .argv = argv,
             .cwd = .{ .path = cpython_dir },
         }) catch |err| std.debug.panic("failed to run ./configure: {t}", .{err});
         if (!result.term.success()) {
@@ -415,6 +472,56 @@ pub fn addDeepfreeze(
     return out;
 }
 
+/// Libraries a target's own libc accounts for, so a `-l<name>` naming one needs
+/// nothing from this project and nothing from the build host. This is musl's own
+/// `EMPTY_LIB_NAMES` -- the archives it ships empty because the implementations live in
+/// libc proper -- and glibc splits the same set into stub `.so`s that resolve just as
+/// unconditionally.
+const libc_provided_libraries = std.StaticStringMap(void).initComptime(.{
+    .{"m"},    .{"rt"},   .{"pthread"}, .{"crypt"},
+    .{"util"}, .{"xnet"}, .{"resolv"},  .{"dl"},
+    .{"c"},    .{"gcc"},  .{"gcc_eh"},
+});
+
+/// The first system library in `link_tokens` that cannot be provided for `target`:
+/// neither vendored by this project (`overrides`) nor part of the target's libc.
+///
+/// This is what decides whether a module is buildable *before* trying, and it exists
+/// because `./configure` decides the module set by probing the build machine. For a
+/// cross target its answers describe the wrong system: it offers `_bz2`, `_lzma`,
+/// `readline`, `nis`, `_uuid` and `_blake2` on the strength of the host's headers, and
+/// the link then fails ("unable to find dynamic system library 'bz2'") -- taking the
+/// whole `install` step down with it, so modules that *would* have installed are
+/// missing from the prefix too. Answering here instead turns each of those into one
+/// skipped module and a complete build.
+///
+/// A native build keeps its old behaviour: the host's libraries *are* the target's, so
+/// anything installed on it is fair game and gets bundled by the consumer afterwards.
+/// Vendoring one of these (a `build.zig.zon` dependency plus a `static_overrides`
+/// entry) is what turns its module back on for cross targets, one at a time.
+pub fn unprovidableLibrary(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    link_tokens: []const u8,
+    overrides: []const StaticOverride,
+) ?[]const u8 {
+    const host = b.graph.host.result;
+    const native = target.result.cpu.arch == host.cpu.arch and
+        target.result.os.tag == host.os.tag and
+        target.result.abi == host.abi;
+    if (native) return null;
+    var it = std.mem.tokenizeAny(u8, link_tokens, " \t");
+    while (it.next()) |tok| {
+        if (!std.mem.startsWith(u8, tok, "-l")) continue;
+        const lib_name = tok[2..];
+        if (lib_name.len == 0) continue;
+        if (libc_provided_libraries.has(lib_name)) continue;
+        if (findOverride(overrides, lib_name) != null) continue;
+        return lib_name;
+    }
+    return null;
+}
+
 pub fn addSharedModule(
     b: *std.Build,
     cpython_dir: std.Build.LazyPath,
@@ -436,6 +543,15 @@ pub fn addSharedModule(
         std.debug.print("warning: no build rule found for module '{s}', skipping\n", .{name});
         return null;
     };
+    const link_tokens = std.mem.join(gpa, " ", rule.recipe) catch @panic("OOM");
+    if (unprovidableLibrary(b, target, link_tokens, overrides)) |lib_name| {
+        std.debug.print(
+            "skipping module '{s}': it needs the system library '{s}', which is " ++
+                "neither built from source here nor part of {s}'s libc\n",
+            .{ name, lib_name, target.query.zigTriple(gpa) catch @panic("OOM") },
+        );
+        return null;
+    }
 
     const mod = b.createModule(.{ .target = target, .optimize = optimize, .strip = strip, .link_libc = true });
     mod.addIncludePath(cpython_dir);
@@ -475,7 +591,7 @@ pub fn addSharedModule(
             .flags = extractIncludePaths(mod, b, cpython_dir, gpa, Makefile.tokens(gpa, mk.get(gpa, archive.cflags_var))),
         });
     }
-    applyLinkTokens(mod, std.mem.join(gpa, " ", rule.recipe) catch @panic("OOM"), overrides);
+    applyLinkTokens(mod, link_tokens, overrides);
 
     if (python_lib) |lib| {
         mod.linkLibrary(lib);

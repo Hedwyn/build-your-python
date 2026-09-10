@@ -72,7 +72,7 @@ fn buildWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
 
     // ---- host side: configure+build the bootstrap tools natively (Linux),
     // completely independent of the Windows `target` below.
-    Utils.runConfigure(b, cpython_dir_str, prefix, b.graph.host, .Debug, null);
+    Utils.runConfigure(b, cpython_dir_str, prefix, b.graph.host, .Debug, options);
 
     const makefile_path = b.pathJoin(&.{ cpython_dir_str, "Makefile" });
     const makefile_text = std.Io.Dir.cwd().readFileAlloc(b.graph.io, makefile_path, gpa, .unlimited) catch |err|
@@ -329,7 +329,7 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     const cpython_dir = b.path("cpython");
     const prefix = b.pathJoin(&.{ build_root, "zig-out" });
 
-    Utils.runConfigure(b, cpython_dir_str, prefix, target, optimize, options.pyconfig_header);
+    Utils.runConfigure(b, cpython_dir_str, prefix, target, optimize, options);
 
     // `./configure` isn't cross-aware (see build/utils.zig's runConfigure):
     // run natively, it misdetects several glibc-only features as available
@@ -739,12 +739,25 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     if (options.openssl_linkage == .static) {
         const openssl_dep = b.dependency("openssl", .{ .target = target, .optimize = optimize });
         const openssl_lib = openssl_dep.artifact("openssl");
+        // PIC, for the same reason as zlib and libffi: `_ssl` and `_hashlib` are shared
+        // modules, and a non-PIC archive cannot be linked into one.
+        openssl_lib.root_module.pic = true;
         static_overrides.append(gpa, .{ .lib_name = "ssl", .artifact = openssl_lib }) catch @panic("OOM");
         static_overrides.append(gpa, .{ .lib_name = "crypto", .artifact = openssl_lib }) catch @panic("OOM");
     }
     if (options.libffi_linkage == .static) {
         const libffi_dep = b.dependency("libffi", .{ .target = target, .optimize = optimize });
-        static_overrides.append(gpa, .{ .lib_name = "ffi", .artifact = libffi_dep.artifact("ffi") }) catch @panic("OOM");
+        const libffi_lib = libffi_dep.artifact("ffi");
+        // Same requirement as zlib's `.pie = true` above, asked for differently because
+        // this package exposes no option for it: `_ctypes` is a *shared* module, and a
+        // static archive built without PIC cannot be linked into one -- lld rejects it
+        // with "relocation R_X86_64_64 cannot be used against local symbol; recompile
+        // with -fPIC", once per relocation, which is what `_ctypes`' several hundred
+        // errors on a musl target actually are. Setting it on the dependency's own
+        // module reaches inside that package, which is not lovely, but the alternative
+        // is shipping no `ctypes` at all.
+        libffi_lib.root_module.pic = true;
+        static_overrides.append(gpa, .{ .lib_name = "ffi", .artifact = libffi_lib }) catch @panic("OOM");
     }
 
     var shared_libs: std.ArrayList(*std.Build.Step.Compile) = .empty;
