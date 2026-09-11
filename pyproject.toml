@@ -24,3 +24,4 @@ exclude = ["cpython/.git"]
 "build.zig.zon" = "metapython/_vendor/build.zig.zon"
 "build" = "metapython/_vendor/build"
 "cpython" = "metapython/_vendor/cpython"
+"vendoring" = "metapython/_vendor/vendoring"

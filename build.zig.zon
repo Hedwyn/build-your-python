@@ -1,7 +1,7 @@
 .{
     .name = .meta_python,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0-dev.857",
+    .minimum_zig_version = "0.17.0-dev.1941",
     .fingerprint = 0xb68c175e8c6315d7,
     .dependencies = .{
         .zlib = .{
@@ -68,22 +68,22 @@
         // <url>` elsewhere reliably prints a different, non-matching one.
         .@"3.12.13" = .{
             .url = "https://www.python.org/ftp/python/3.12.13/Python-3.12.13.tgz",
-            .hash = "N-V-__8AACKyDQb8uEoQpf8usU6Ye5sh8RBeuDzcWcTPvnI0",
+            .hash = "N-V-__8AACKyDQZ8F7LvEgi9FxB7FywC42NT1iGgQG62Ipcv",
             .lazy = true,
         },
         .@"3.13.8" = .{
             .url = "https://www.python.org/ftp/python/3.13.8/Python-3.13.8.tgz",
-            .hash = "N-V-__8AAA9-VAbnYWOoGSG7HYz9wxkKqMcPPK26ryL7Op_F",
+            .hash = "N-V-__8AAA9-VAZeGNDngevYCwIGqBAp80E6fpDoll2MemTW",
             .lazy = true,
         },
         .@"3.11.13" = .{
             .url = "https://www.python.org/ftp/python/3.11.13/Python-3.11.13.tgz",
-            .hash = "N-V-__8AAF_HzQXoNUU908eR19mrnNEy2IlNvZ4-nCKjN8A6",
+            .hash = "N-V-__8AAF_HzQWJigIy6Bq0VxllPr_xdgh3bwqAYQ9pF4Sq",
             .lazy = true,
         },
         .@"3.14.2" = .{
             .url = "https://www.python.org/ftp/python/3.14.2/Python-3.14.2.tgz",
-            .hash = "N-V-__8AAGxevgZa5YqaPjAumJtx4dq2jkX_Cbefo31dGs0Q",
+            .hash = "N-V-__8AAApY1QYlWt9ptrVuD4gOIUPtmFUY9FK0jjfsOM_j",
             .lazy = true,
         },
     },

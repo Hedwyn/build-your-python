@@ -21,6 +21,7 @@
 //! own stamp file back into that same directory, exactly as it always has
 //! for the submodule checkout.
 const std = @import("std");
+const ArchiveRoot = @import("archive_root.zig");
 
 pub const default_version = "3.12.13";
 
@@ -63,40 +64,15 @@ pub fn resolve(b: *std.Build) ?Source {
     const dep = b.lazyDependency(version, .{}) orelse return null;
     const fetched_dir_str = dep.builder.root.root_dir.path orelse
         std.debug.panic("expected absolute cpython dependency root path for '{s}'", .{version});
-    const sub_path = descendToRoot(b, fetched_dir_str);
+    // A release tarball (e.g. python.org's) wraps its whole tree in one
+    // `Python-X.Y.Z/`-shaped directory. Whether this pinned Zig's fetcher strips
+    // that wrapper turns out to be inconsistent -- confirmed empirically across
+    // otherwise-identically-shaped python.org tarballs for different versions,
+    // same wrapped-single-directory layout on disk before fetching, yet one
+    // fetch left it in place and another stripped it (see `ArchiveRoot`).
+    // Marker is `configure` specifically (not e.g. `setup.py`, which 3.14
+    // dropped) since it's present at every supported version's true root and
+    // it's the exact file `Utils.runConfigure` is about to invoke anyway.
+    const sub_path = ArchiveRoot.resolve(b, fetched_dir_str, "configure");
     return .{ .dir = dep.path(sub_path), .dir_str = b.pathJoin(&.{ fetched_dir_str, sub_path }) };
-}
-
-/// A release tarball (e.g. python.org's) wraps its whole tree in one
-/// `Python-X.Y.Z/`-shaped directory. Whether this pinned Zig's fetcher strips
-/// that wrapper turns out to be inconsistent -- confirmed empirically across
-/// otherwise-identically-shaped python.org tarballs for different versions,
-/// same wrapped-single-directory layout on disk before fetching, yet one
-/// fetch left it in place and another stripped it. Detects the actual result
-/// generically instead of assuming either way: no `configure` at the root,
-/// but exactly one entry and it's a directory -- descend into it. Marker is
-/// `configure` specifically (not e.g. `setup.py`, which 3.14 dropped) since
-/// it's present at every supported version's true root and it's the exact
-/// file `Utils.runConfigure` is about to invoke anyway.
-fn descendToRoot(b: *std.Build, dir_str: []const u8) []const u8 {
-    const io = b.graph.io;
-    const cwd = std.Io.Dir.cwd();
-    cwd.access(io, b.pathJoin(&.{ dir_str, "configure" }), .{}) catch {
-        var dir = cwd.openDir(io, dir_str, .{ .iterate = true }) catch |err|
-            std.debug.panic("failed to open fetched cpython source dir {s}: {t}", .{ dir_str, err });
-        defer dir.close(io);
-        var it = dir.iterate();
-        const first = (it.next(io) catch |err|
-            std.debug.panic("failed to read {s}: {t}", .{ dir_str, err })) orelse
-            std.debug.panic("fetched cpython source dir {s} is empty", .{dir_str});
-        const second = it.next(io) catch |err|
-            std.debug.panic("failed to read {s}: {t}", .{ dir_str, err });
-        if (first.kind != .directory or second != null)
-            std.debug.panic(
-                "fetched cpython source dir {s} has no configure script at its root and isn't a single wrapping directory either -- unexpected archive layout",
-                .{dir_str},
-            );
-        return b.dupe(first.name);
-    };
-    return "";
 }
