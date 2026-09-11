@@ -421,8 +421,12 @@ fn addCoreObjects(
     /// *before* `cpython_dir` itself. Windows needs this: its `pyconfig.h`
     /// lives in `PC/`, not the cpython root, and the root may separately
     /// hold an autoconf-generated `pyconfig.h` (from configuring the host
-    /// toolchain for the bootstrap tools) that must not shadow it. `null`
-    /// (every POSIX call site) leaves lookup order exactly as before.
+    /// toolchain for the bootstrap tools) that must not shadow it.
+    /// `buildPosix`'s own stage 1/2 need it for the mirror-image reason on a
+    /// CPU-arch cross build: `cpython_dir`'s `pyconfig.h` is the *target's*
+    /// by the time they compile, and they're host-native tools -- see
+    /// `native_pyconfig_dir` there. `null` everywhere else leaves lookup
+    /// order exactly as before.
     primary_include: ?std.Build.LazyPath,
 ) void {
     if (primary_include) |p| mod.addIncludePath(p);

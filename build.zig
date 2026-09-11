@@ -363,6 +363,76 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         );
     }
 
+    // Stage 1/2 below (freeze_module_exe, bootstrap_exe) are host-native tools,
+    // same as buildWindows' own bootstrap stage -- but unlike buildWindows (which
+    // never runs `./configure` for anything but the host, and derives its whole
+    // `host_*` compile input set -- cflags, sources, link libs -- from that native
+    // configure alone), the `runConfigure` call right after this one reconfigures
+    // this checkout's *single* `cpython/Makefile`+`pyconfig.h` for `target`, and
+    // stage 1/2 below were, until this block existed, compiled from *that* target
+    // Makefile's sources/cflags while still targeting the host. For a genuinely
+    // different CPU architecture than the host's this is doubly wrong, not just in
+    // pyconfig.h's word-size macros (verified: `Include/pyport.h`'s own
+    // self-consistency check, "LONG_BIT definition appears wrong for platform",
+    // aborts compiling arm-linux-gnueabihf's stage 1 on an x86_64 host) but in the
+    // *source list* too: `PY_HAVE_PERF_TRAMPOLINE` is undefined in an armv7
+    // pyconfig.h (real, target-correct -- perf trampolines need an arch-specific
+    // assembly file this project has no armv7 source for), yet a native pyconfig.h
+    // swapped in by primary_include alone defines it (x86_64 has real trampoline
+    // support) while `core_sources` still comes from the *target* Makefile, which
+    // never lists `Python/asm_trampoline.o` for the same reason -- so
+    // `perf_trampoline.c` compiles as if it needs `_Py_trampoline_func_start`/`_end`
+    // and nothing supplies them: an "undefined symbol" link failure, not a compile
+    // error, so the mismatch is silent until the very last step. Same-arch targets
+    // (native, or musl-on-glibc) don't need any of this: `cpython/Makefile` and
+    // `cpython/pyconfig.h` already describe the host correctly, self-consistently,
+    // by construction.
+    //
+    // Fixed by fully mirroring buildWindows' own separation: configure the host
+    // natively first (into the same shared `cpython/` -- see `native_pyconfig_dir`'s
+    // own note on why `options.pyconfig_header` is cleared for this call only),
+    // snapshot pyconfig.h for `primary_include` to shadow with (same reasoning as
+    // buildWindows avoiding the mirror-image shadowing problem), and additionally
+    // snapshot the Makefile text so `host_core_cflags`/`host_core_sources.items`/
+    // `host_link_libs`/`host_dynload_flags`/`host_getpath_flags` below can be
+    // derived from *it*, exactly the way buildWindows derives its own `host_*` set
+    // -- instead of reusing `core_cflags`/`core_sources`/`link_libs`/`dynload_flags`/
+    // `getpath_flags`, which stay target-derived for stage 3 below. `.Debug`
+    // optimize, not `optimize`: stage 1/2 are always built `.Debug` (matching
+    // buildWindows), regardless of what `-Doptimize=` the real target build asked
+    // for, and `--with-pydebug` vs `--enable-optimizations` changes ABI-affecting
+    // macros (`Py_DEBUG`, ...) that this snapshot has to match.
+    var native_pyconfig_dir: ?std.Build.LazyPath = null;
+    var host_makefile_text: ?[]const u8 = null;
+    if (cross_arch) {
+        // `options.pyconfig_header` (a caller-supplied override, e.g. smelt's own
+        // `_resolve_pyconfig_header`) is *target*-shaped -- `runConfigure` copies it
+        // over whatever `./configure` just produced, for *any* target it's given,
+        // native included. Left as-is, this native pass would snapshot the same
+        // target header all over again instead of a real native one. Clear it for
+        // this call only: the native snapshot must be real `./configure` cross
+        // detection run natively, never the caller's target override.
+        var native_options = options;
+        native_options.pyconfig_header = null;
+        Utils.runConfigure(b, cpython_dir_str, prefix, b.graph.host, .Debug, native_options);
+
+        const snapshot_dir = b.pathJoin(&.{ build_root, ".zig-cache", "metapython-native-pyconfig" });
+        std.Io.Dir.cwd().createDirPath(b.graph.io, snapshot_dir) catch |err|
+            std.debug.panic("failed to create {s}: {t}", .{ snapshot_dir, err });
+        const native_pyconfig_h_path = b.pathJoin(&.{ cpython_dir_str, "pyconfig.h" });
+        const native_pyconfig_text = std.Io.Dir.cwd().readFileAlloc(b.graph.io, native_pyconfig_h_path, gpa, .unlimited) catch |err|
+            std.debug.panic("failed to read {s}: {t}", .{ native_pyconfig_h_path, err });
+        std.Io.Dir.cwd().writeFile(b.graph.io, .{
+            .sub_path = b.pathJoin(&.{ snapshot_dir, "pyconfig.h" }),
+            .data = native_pyconfig_text,
+        }) catch |err| std.debug.panic("failed to write {s}/pyconfig.h: {t}", .{ snapshot_dir, err });
+        native_pyconfig_dir = .{ .cwd_relative = snapshot_dir };
+
+        const native_makefile_path = b.pathJoin(&.{ cpython_dir_str, "Makefile" });
+        host_makefile_text = std.Io.Dir.cwd().readFileAlloc(b.graph.io, native_makefile_path, gpa, .unlimited) catch |err|
+            std.debug.panic("failed to read {s}: {t}", .{ native_makefile_path, err });
+    }
+
     Utils.runConfigure(b, cpython_dir_str, prefix, target, optimize, options);
 
     // `./configure` gets `pyconfig.h` wrong in two different, independent
@@ -542,6 +612,46 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     };
     const getpath_flags = std.mem.concat(gpa, []const u8, &.{ core_cflags, &getpath_defines }) catch @panic("OOM");
 
+    // Stage 1/2's own compile inputs -- see `native_pyconfig_dir`'s note above for
+    // why these have to be *host*-derived rather than reusing `core_cflags`/
+    // `core_sources`/`link_libs`/`dynload_flags`/`getpath_flags` above (target-
+    // derived, correct for stage 3 below). Mirrors buildWindows' own `host_core_cflags`/
+    // `host_all_core_sources`/`host_link_libs`/`host_dynload_flags`/`host_getpath_flags`
+    // derivation exactly, just from the native Makefile snapshotted alongside
+    // `native_pyconfig_dir` instead of buildWindows' always-native one. `host_makefile_text`
+    // is only set when `cross_arch` (see above) -- same-arch targets reuse the target
+    // variables outright, since target and host already agree.
+    var host_core_cflags = core_cflags;
+    var host_core_sources: std.ArrayList([]const u8) = .empty;
+    host_core_sources.appendSlice(gpa, core_sources.items) catch @panic("OOM");
+    var host_link_libs = link_libs;
+    var host_dynload_flags = dynload_flags;
+    var host_getpath_flags = getpath_flags;
+    if (host_makefile_text) |host_text| {
+        const host_mk: Makefile = .{ .text = host_text };
+        host_core_cflags = std.mem.concat(gpa, []const u8, &.{
+            Makefile.tokens(gpa, host_mk.get(gpa, "PY_CORE_CFLAGS")),
+            &[_][]const u8{"-Wno-error=date-time"},
+        }) catch @panic("OOM");
+        const host_all_core_sources = Utils.fixupSourceExtensions(
+            b,
+            cpython_dir_str,
+            Makefile.objsToSources(gpa, host_mk.get(gpa, "LIBRARY_OBJS_OMIT_FROZEN")),
+        );
+        host_core_sources = .empty;
+        for (host_all_core_sources) |s| {
+            if (!std.mem.eql(u8, s, dynload_src)) host_core_sources.append(gpa, s) catch @panic("OOM");
+        }
+        host_link_libs = std.mem.concat(gpa, u8, &.{
+            host_mk.get(gpa, "LIBS"), " ", host_mk.get(gpa, "MODLIBS"), " ", host_mk.get(gpa, "SYSLIBS"),
+        }) catch @panic("OOM");
+        host_dynload_flags = std.mem.concat(gpa, []const u8, &.{
+            host_core_cflags,
+            &[_][]const u8{b.fmt("-DSOABI=\"{s}\"", .{host_mk.get(gpa, "SOABI")})},
+        }) catch @panic("OOM");
+        host_getpath_flags = std.mem.concat(gpa, []const u8, &.{ host_core_cflags, &getpath_defines }) catch @panic("OOM");
+    }
+
     const freeze_entries = mk.freezeEntries(gpa);
 
     // ---- stage 1: freeze_module (a compiled tool, not a real interpreter)
@@ -552,15 +662,16 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // it doesn't need to discover sys.path -- it just freezes files passed as args.
     const freeze_module_exe = Utils.addExe(b, cpython_dir, b.graph.host, .Debug, false, gpa, .{
         .name = "freeze_module",
-        .core_sources = core_sources.items,
-        .core_cflags = core_cflags,
+        .core_sources = host_core_sources.items,
+        .core_cflags = host_core_cflags,
         .extra_sources = &.{ "Programs/_freeze_module.c", "Modules/getpath_noop.c" },
-        .extra_flags = core_cflags,
-        .link_libs = link_libs,
+        .extra_flags = host_core_cflags,
+        .link_libs = host_link_libs,
         .frozen_headers = &.{},
-        .dynload_flags = dynload_flags,
+        .dynload_flags = host_dynload_flags,
         .dynload_source = cpython_dir.path(b, "Python/dynload_shlib.c"),
         .linkage = options.libc_linkage,
+        .primary_include = native_pyconfig_dir,
     });
 
     var early_headers = std.StringHashMap(std.Build.LazyPath).init(gpa);
@@ -583,15 +694,16 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // bootstrap stage 3.
     const bootstrap_exe = Utils.addExe(b, cpython_dir, b.graph.host, .Debug, false, gpa, .{
         .name = "_bootstrap_python",
-        .core_sources = core_sources.items,
-        .core_cflags = core_cflags,
+        .core_sources = host_core_sources.items,
+        .core_cflags = host_core_cflags,
         .extra_sources = &.{ "Programs/_bootstrap_python.c", "Modules/getpath.c" },
-        .extra_flags = getpath_flags,
-        .link_libs = link_libs,
+        .extra_flags = host_getpath_flags,
+        .link_libs = host_link_libs,
         .frozen_headers = early_headers_list.items,
-        .dynload_flags = dynload_flags,
+        .dynload_flags = host_dynload_flags,
         .dynload_source = cpython_dir.path(b, "Python/dynload_shlib.c"),
         .linkage = options.libc_linkage,
+        .primary_include = native_pyconfig_dir,
     });
 
     // _bootstrap_python needs Lib/ sitting next to it (in the layout getpath.c's
