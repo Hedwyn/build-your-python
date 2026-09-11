@@ -1,0 +1,17 @@
+.{
+    .name = .openssl,
+    .version = "3.3.2",
+    .fingerprint = 0x773a47f16a1bc133,
+    .dependencies = .{
+        .openssl_src = .{
+            .url = "https://github.com/openssl/openssl/releases/download/openssl-3.3.2/openssl-3.3.2.tar.gz",
+            .hash = "N-V-__8AAJRw2wONh5R3qPQTVc7VdEgCGJsjAw3CSWxDFr_H",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "archive_root.zig",
+        "generated",
+    },
+}
