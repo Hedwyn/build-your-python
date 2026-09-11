@@ -23,15 +23,21 @@ const Pyconfig = @import("build/pyconfig.zig");
 const Vcxproj = @import("build/vcxproj.zig");
 const Sourcepatch = @import("build/sourcepatch.zig");
 const Musl = @import("build/musl.zig");
+const CpythonSource = @import("build/cpython_source.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const options = Options.parseOptions(b);
 
+    // `null` means the `-Dcpython-version=` dependency was just queued for
+    // fetching (see CpythonSource.resolve's own doc comment) -- bail with no
+    // steps added; `zig build` fetches it and reruns this function.
+    const cpython = CpythonSource.resolve(b) orelse return;
+
     switch (target.result.os.tag) {
-        .windows => buildWindows(b, target, optimize, options),
-        else => buildPosix(b, target, optimize, options),
+        .windows => buildWindows(b, target, optimize, options, cpython),
+        else => buildPosix(b, target, optimize, options, cpython),
     }
 }
 
@@ -63,11 +69,11 @@ pub fn build(b: *std.Build) void {
 //   constraint. Confirmed empirically: `zig cc -target x86_64-windows-msvc`
 //   fails to link libc at all, `x86_64-windows-gnu` works with zero extra
 //   setup. Tradeoff: no ABI compat with official PyPI Windows wheels.
-fn buildWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, options: Options.BuildOptions) void {
+fn buildWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, options: Options.BuildOptions, cpython: CpythonSource.Source) void {
     const gpa = b.allocator;
     const build_root = b.root.root_dir.path orelse @panic("expected absolute build root path");
-    const cpython_dir_str = b.pathJoin(&.{ build_root, "cpython" });
-    const cpython_dir = b.path("cpython");
+    const cpython_dir_str = cpython.dir_str;
+    const cpython_dir = cpython.dir;
     const prefix = b.pathJoin(&.{ build_root, "zig-out" });
 
     // ---- host side: configure+build the bootstrap tools natively (Linux),
@@ -322,39 +328,34 @@ fn buildWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     }).step);
 }
 
-fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, options: Options.BuildOptions) void {
+fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, options: Options.BuildOptions, cpython: CpythonSource.Source) void {
     const gpa = b.allocator;
     const build_root = b.root.root_dir.path orelse @panic("expected absolute build root path");
-    const cpython_dir_str = b.pathJoin(&.{ build_root, "cpython" });
-    const cpython_dir = b.path("cpython");
+    const cpython_dir_str = cpython.dir_str;
+    const cpython_dir = cpython.dir;
     const prefix = b.pathJoin(&.{ build_root, "zig-out" });
 
-    // openssl/sqlite3 static linking don't work yet for a genuinely different
-    // CPU architecture than the build machine's own (same-arch targets --
+    // sqlite3 static linking doesn't work yet for a genuinely different CPU
+    // architecture than the build machine's own (same-arch targets --
     // native, or musl-on-glibc -- are unaffected, so this is gated on that
-    // specifically, not on cross-compiling in general):
-    //  - the vendored `allyourcodebase/openssl` package's own build.zig
-    //    unconditionally builds x86_64 inline-asm sources (e.g.
-    //    `crypto/bn/asm/x86_64-gcc.c`) and never generates the ARM-specific
-    //    `arm_arch.h` those sources also need -- verified failing on
-    //    `-Dtarget=aarch64-linux-gnu` with 23 compile errors.
-    //  - `./configure`'s uncached `AC_CHECK_HEADER([sqlite3.h])` probe (see
-    //    build/utils.zig's sqlite3 `LIBSQLITE3_CFLAGS=-I...` cache-var seed)
-    //    fails to find the header under real `--host` cross mode: the `-I`
-    //    path it seeds is captured relative to a cwd that probe doesn't share.
-    // Panic with an actionable message instead of letting either surface as a
-    // confusing downstream compile failure -- see roadmap.md for the full
-    // investigation and what unblocking each would take.
+    // specifically, not on cross-compiling in general): `./configure`'s
+    // uncached `AC_CHECK_HEADER([sqlite3.h])` probe (see build/utils.zig's
+    // sqlite3 `LIBSQLITE3_CFLAGS=-I...` cache-var seed) fails to find the
+    // header under real `--host` cross mode -- the `-I` path it seeds is
+    // captured relative to a cwd that probe doesn't share. Panic with an
+    // actionable message instead of letting this surface as a confusing
+    // downstream compile failure -- see roadmap.md for the full
+    // investigation and what unblocking it would take.
+    //
+    // openssl used to have the same restriction (the old
+    // `allyourcodebase/openssl` package's build.zig unconditionally built
+    // x86_64 inline-asm sources with no ARM/etc. equivalent) -- fixed by
+    // vendoring OpenSSL from scratch with assembly optimizations off, which
+    // is arch-agnostic by construction (see vendoring/openssl/build.zig).
     const cross_arch = target.result.cpu.arch != b.graph.host.result.cpu.arch;
     if (cross_arch) {
         const host_arch_name = @tagName(b.graph.host.result.cpu.arch);
         const target_arch_name = @tagName(target.result.cpu.arch);
-        if (options.openssl_linkage == .static) std.debug.panic(
-            "-Dopenssl-linkage=static is not supported yet when cross-compiling to a " ++
-                "different CPU architecture ({s} host -> {s} target) -- pass " ++
-                "-Dopenssl-linkage=off (or =dynamic, if the target has a system OpenSSL) instead",
-            .{ host_arch_name, target_arch_name },
-        );
         if (options.sqlite_linkage == .static) std.debug.panic(
             "-Dsqlite-linkage=static is not supported yet when cross-compiling to a " ++
                 "different CPU architecture ({s} host -> {s} target) -- pass " ++

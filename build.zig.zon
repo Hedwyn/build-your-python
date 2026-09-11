@@ -8,10 +8,14 @@
             .url = "https://github.com/allyourcodebase/zlib/archive/refs/tags/1.3.2.tar.gz",
             .hash = "zlib-1.3.2-ZZQ7lc8NAAAHm9MDfplvwoesXvk4tVm6VCsiI8KnIbT0",
         },
-        .openssl = .{
-            .url = "https://github.com/allyourcodebase/openssl/archive/6b318b447c8ff7529e3a2337a1df2a9b4816fee2.tar.gz",
-            .hash = "openssl-3.3.2-TC9C3Ze3ZABaKR5hc8KRnRPhTClKrKQKqTnXTUYkvmSR",
-        },
+        // Not `allyourcodebase/openssl` any more: that package ships
+        // pre-generated x86_64-only assembly with no per-arch variants,
+        // panicking on any genuine cross-CPU-arch build -- own build.zig,
+        // built with assembly optimizations off (portable C only), wrapping
+        // the real upstream OpenSSL release source (see
+        // vendoring/openssl/build.zig's own doc comment for the full
+        // rationale and how its source list was derived).
+        .openssl = .{ .path = "vendoring/openssl" },
         .libffi = .{
             .url = "https://github.com/allyourcodebase/libffi/archive/refs/tags/v3.5.2.tar.gz",
             .hash = "libffi-3.5.2-QhHaJyYYAAA1JzdzpVppCdz543jMEJGazBWhRR_FMvRg",
@@ -42,6 +46,46 @@
         // tarball: see vendoring/lzma/build.zig's own doc comment on why
         // that distinction matters for this specific library).
         .lzma = .{ .path = "vendoring/lzma" },
+
+        // CPython source, one entry per version this project curates --
+        // `-Dcpython-version=<name>` (see build/cpython_source.zig) picks
+        // which one actually gets fetched; the rest stay untouched thanks to
+        // `.lazy = true`. Not restricted to this list: `zig fetch
+        // --save=<name> <url-or-git-ref>` adds any CPython source (a fork,
+        // an unreleased tag, a local patch set pushed somewhere reachable)
+        // under a name of your choosing, right here, the same way these
+        // three were added -- then `-Dcpython-version=<name>` selects it
+        // exactly like a curated one. That command is Zig's own fetcher
+        // (tarball or `git+https://`), so no system `git` is ever required.
+        //
+        // python.org's own release tarballs, not GitHub's `archive/refs/tags/`
+        // endpoint: identical either way content-wise, but whichever URL is
+        // used, get its hash with `zig fetch --save=<name> <url>` run from
+        // *this* project (not `zig fetch <url>` alone, and not run from some
+        // other project/scratch dir) -- confirmed empirically while adding
+        // these three that only that in-project, name-bound fetch reproduces
+        // the hash `zig build` itself later checks against; a bare `zig fetch
+        // <url>` elsewhere reliably prints a different, non-matching one.
+        .@"3.12.13" = .{
+            .url = "https://www.python.org/ftp/python/3.12.13/Python-3.12.13.tgz",
+            .hash = "N-V-__8AACKyDQb8uEoQpf8usU6Ye5sh8RBeuDzcWcTPvnI0",
+            .lazy = true,
+        },
+        .@"3.13.8" = .{
+            .url = "https://www.python.org/ftp/python/3.13.8/Python-3.13.8.tgz",
+            .hash = "N-V-__8AAA9-VAbnYWOoGSG7HYz9wxkKqMcPPK26ryL7Op_F",
+            .lazy = true,
+        },
+        .@"3.11.13" = .{
+            .url = "https://www.python.org/ftp/python/3.11.13/Python-3.11.13.tgz",
+            .hash = "N-V-__8AAF_HzQXoNUU908eR19mrnNEy2IlNvZ4-nCKjN8A6",
+            .lazy = true,
+        },
+        .@"3.14.2" = .{
+            .url = "https://www.python.org/ftp/python/3.14.2/Python-3.14.2.tgz",
+            .hash = "N-V-__8AAGxevgZa5YqaPjAumJtx4dq2jkX_Cbefo31dGs0Q",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
