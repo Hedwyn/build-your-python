@@ -173,7 +173,14 @@ fn buildWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
             deepfreeze_names.append(gpa, f.name) catch @panic("OOM");
         }
     }
-    const deepfreeze_c = Utils.addDeepfreeze(b, cpython_dir, bootstrap_packaged_exe, deepfreeze_headers.items, deepfreeze_names.items);
+    const deepfreeze_script = Sourcepatch.applyIfPresent(
+        b,
+        gpa,
+        cpython_dir_str,
+        Sourcepatch.deepfreezePatch(gpa, cpython_dir_str),
+        &.{"umarshal.py"},
+    );
+    const deepfreeze_c = Utils.addDeepfreeze(b, deepfreeze_script, bootstrap_packaged_exe, deepfreeze_headers.items, deepfreeze_names.items);
 
     // ---- target side: the real Windows build, sourced from pythoncore.vcxproj.
     const pythoncore_vcxproj_path = b.pathJoin(&.{ cpython_dir_str, "PCbuild", "pythoncore.vcxproj" });
@@ -222,6 +229,9 @@ fn buildWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         "-DVPATH=\"\"",
         "-DPLATLIBDIR=\"DLLs\"",
         "-Wno-error=date-time",
+        // See core_cflags' own comment on this one below -- same reason,
+        // same fix, same generated deepfreeze.c triggering it either way.
+        "-Wno-unterminated-string-initialization",
         // MSBuild-property-only placeholder (see pythoncore.vcxproj's
         // `MS_DLL_ID="$(SysWinVer)"`) that PC/dl_nt.c also reads directly as
         // code, not just from the .rc resource we don't compile. Just a
@@ -267,8 +277,8 @@ fn buildWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     // Clang-rejected lines in CPython's own Windows sources (see windows.md's
     // "Status" section for the full investigation of each). Applied to
     // build-time copies only -- the cpython submodule itself is untouched.
-    const dynload_win_patched = Sourcepatch.applyNamed(b, gpa, cpython_dir_str, Sourcepatch.mingw_fixups, "Python/dynload_win.c");
-    const winapi_patched = Sourcepatch.applyNamed(b, gpa, cpython_dir_str, Sourcepatch.mingw_fixups, "Modules/_winapi.c");
+    const dynload_win_patched = Sourcepatch.applyNamed(b, gpa, cpython_dir_str, Sourcepatch.mingw_fixups, "Python/dynload_win.c", &.{});
+    const winapi_patched = Sourcepatch.applyNamed(b, gpa, cpython_dir_str, Sourcepatch.mingw_fixups, "Modules/_winapi.c", &.{});
 
     const libpython_lib = Utils.addPythonLib(b, cpython_dir, target, optimize, options.strip, gpa, .{
         .name = b.fmt("python{s}", .{version}),
@@ -306,7 +316,7 @@ fn buildWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     // Zig version's mingw-w64 integration unconditionally links its own
     // bundled ANSI crt2.o (expects `main`/`WinMain`) for a windows-gnu exe,
     // with no exposed way to request the wide-entry CRT variant instead.
-    const python_c_patched = Sourcepatch.applyNamed(b, gpa, cpython_dir_str, Sourcepatch.mingw_fixups, "Programs/python.c");
+    const python_c_patched = Sourcepatch.applyNamed(b, gpa, cpython_dir_str, Sourcepatch.mingw_fixups, "Programs/python.c", &.{});
     shim_mod.addCSourceFile(.{
         .file = python_c_patched,
         .flags = &.{ "-DPy_BUILD_CORE", "-D_CONSOLE" },
@@ -532,10 +542,20 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // than given per-file recipes: no other core source reads any of the three macros
     // (verified by grep across `Python/`, `Modules/`, `Objects/` and the public headers),
     // so the bulk compile stays a single step.
+    // `-Wno-unterminated-string-initialization`: CPython 3.13+'s deepfreeze.py
+    // (see Sourcepatch.deepfreezePatch) emits each frozen code object's bytecode
+    // as a plain C string literal sized to fit exactly, deliberately with no
+    // room for a NUL terminator -- valid C (an array need not be
+    // NUL-terminated if the initializer already fills it), but this pinned
+    // Zig's Clang treats it as a hard error by default, suggesting the GNU
+    // `nonstring` attribute CPython's own generated struct fields don't carry.
+    // Demoted back to (a silenced) warning rather than patching every such
+    // literal deepfreeze.py emits.
     const core_cflags = std.mem.concat(gpa, []const u8, &.{
         Makefile.tokens(gpa, mk.get(gpa, "PY_CORE_CFLAGS")),
         &[_][]const u8{
             "-Wno-error=date-time",
+            "-Wno-unterminated-string-initialization",
             b.fmt("-DPLATFORM=\"{s}\"", .{mk.get(gpa, "MACHDEP")}),
             b.fmt("-DABIFLAGS=\"{s}\"", .{mk.get(gpa, "ABIFLAGS")}),
             b.fmt("-DMULTIARCH=\"{s}\"", .{mk.get(gpa, "MULTIARCH")}),
@@ -734,7 +754,14 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         }
     }
 
-    const deepfreeze_c = Utils.addDeepfreeze(b, cpython_dir, bootstrap_packaged_exe, deepfreeze_headers.items, deepfreeze_names.items);
+    const deepfreeze_script = Sourcepatch.applyIfPresent(
+        b,
+        gpa,
+        cpython_dir_str,
+        Sourcepatch.deepfreezePatch(gpa, cpython_dir_str),
+        &.{"umarshal.py"},
+    );
+    const deepfreeze_c = Utils.addDeepfreeze(b, deepfreeze_script, bootstrap_packaged_exe, deepfreeze_headers.items, deepfreeze_names.items);
 
     // ---- stage 3: the final "python" executable (the one users run).
     // Built with the target optimization level (not Debug like stages 1-2).

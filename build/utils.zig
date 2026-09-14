@@ -613,9 +613,15 @@ pub fn packageExe(b: *std.Build, cpython_dir: std.Build.LazyPath, version: []con
 /// steps above actually execute, so the pairing can't be done in build.zig at
 /// graph-construction time -- instead a small native helper
 /// (build/tools/deepfreeze_runner.zig) does it at run time.
+///
+/// `deepfreeze_script` is `Tools/build/deepfreeze.py`, resolved by the caller
+/// rather than derived from a bare `cpython_dir` here -- on 3.13+ it needs
+/// `Sourcepatch.deepfreeze_fixups` applied first (see that patch's own doc
+/// comment), which only the caller (already threading `cpython_dir_str`
+/// through for its own patches) can do.
 pub fn addDeepfreeze(
     b: *std.Build,
-    cpython_dir: std.Build.LazyPath,
+    deepfreeze_script: std.Build.LazyPath,
     bootstrap_packaged_exe: std.Build.LazyPath,
     headers: []const std.Build.LazyPath,
     names: []const []const u8,
@@ -629,7 +635,7 @@ pub fn addDeepfreeze(
 
     const run = b.addRunArtifact(runner);
     run.addFileArg(bootstrap_packaged_exe);
-    run.addFileArg(cpython_dir.path(b, "Tools/build/deepfreeze.py"));
+    run.addFileArg(deepfreeze_script);
     const out = run.addOutputFileArg("deepfreeze.c");
     for (headers, names) |h, name| {
         run.addFileArg(h);
