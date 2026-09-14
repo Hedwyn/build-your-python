@@ -178,7 +178,7 @@ fn buildWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         gpa,
         cpython_dir_str,
         Sourcepatch.deepfreezePatch(b, gpa, cpython_dir_str),
-        Sourcepatch.umarshal_fixups,
+        Sourcepatch.deepfreezeSiblings(gpa, cpython_dir_str),
     );
     const deepfreeze_c = Utils.addDeepfreeze(b, deepfreeze_script, bootstrap_packaged_exe, deepfreeze_headers.items, deepfreeze_names.items);
 
@@ -759,7 +759,7 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         gpa,
         cpython_dir_str,
         Sourcepatch.deepfreezePatch(b, gpa, cpython_dir_str),
-        Sourcepatch.umarshal_fixups,
+        Sourcepatch.deepfreezeSiblings(gpa, cpython_dir_str),
     );
     const deepfreeze_c = Utils.addDeepfreeze(b, deepfreeze_script, bootstrap_packaged_exe, deepfreeze_headers.items, deepfreeze_names.items);
 

@@ -260,6 +260,58 @@ pub const umarshal_fixups: []const Patch = &.{
     },
 };
 
+/// CPython 3.15 split a `consts_getter` helper out of `deepfreeze.py` into its own
+/// module (`Tools/build/consts_getter.py`) and added `import consts_getter` at the
+/// top of `deepfreeze.py` -- `ModuleNotFoundError: No module named 'consts_getter'`
+/// otherwise, since the deepfreeze runner invokes the patched copy from a `.zig-cache`
+/// staging directory, not `Tools/build/` itself, so ordinary same-directory `import`
+/// resolution only sees whatever `apply`'s `siblings` mechanism also copied there --
+/// and once that's fixed, `consts_getter.py`'s own `ROOT = Path(__file__).resolve()
+/// .parents[2]` hits the exact same wrong-directory-depth problem `deepfreezePatch`'s
+/// edit 2 already fixes for `deepfreeze.py` itself (only correct at the file's
+/// original two-directories-deep spot inside a real checkout, never true for a
+/// staged copy) -- `FileNotFoundError` for `pycore_runtime_structs.h` otherwise. A
+/// factory, not a constant `Patch`, for the same reason as `deepfreezePatch`: the
+/// replacement bakes in `cpython_dir_str`, only known at `build()` runtime. `apply`'s
+/// exists-on-disk tolerance for siblings (see its own doc comment) is what keeps this
+/// a no-op on 3.12/3.13/3.14, which don't have this file at all.
+fn constsGetterSibling(gpa: std.mem.Allocator, cpython_dir_str: []const u8) Patch {
+    // `gpa.dupe`, not `&.{...}` directly: this compound literal's `.replacement` is
+    // a runtime `allocPrint` result, so Zig can't treat the array as comptime-static
+    // -- it gets short-lived *stack* storage tied to this function's own call frame
+    // instead, corrupted by the time `apply`'s sibling loop reads it later. The exact
+    // bug already hit and fixed this way in `deepfreezePatch`'s own `Patch` return;
+    // see this project's history for the fuller writeup if this pattern resurfaces.
+    const edits = gpa.dupe(Edit, &.{
+        .{
+            .needle = "ROOT = Path(__file__).resolve().parents[2]",
+            .replacement = std.fmt.allocPrint(
+                gpa,
+                "ROOT = Path({s})",
+                .{pyStringLiteral(gpa, cpython_dir_str)},
+            ) catch @panic("OOM"),
+        },
+    }) catch @panic("OOM");
+    return .{
+        .file = "Tools/build/consts_getter.py",
+        .edits = edits,
+        .reason = "CPython 3.15 split consts_getter out of deepfreeze.py into its own module, " ++
+            "whose ROOT computation assumes the file's original on-disk depth",
+    };
+}
+
+/// Every sibling `deepfreezePatch`'s patched copy of `deepfreeze.py` needs
+/// co-located in its staging directory, across every curated CPython version --
+/// each individually tolerant (see `apply`'s doc comment) of not being needed at all
+/// on a given version. A factory like `deepfreezePatch` itself, for the same reason:
+/// `constsGetterSibling` needs `cpython_dir_str`.
+pub fn deepfreezeSiblings(gpa: std.mem.Allocator, cpython_dir_str: []const u8) []const Patch {
+    return std.mem.concat(gpa, Patch, &.{
+        umarshal_fixups,
+        &.{constsGetterSibling(gpa, cpython_dir_str)},
+    }) catch @panic("OOM");
+}
+
 /// `path` as a Python double-quoted string literal -- only `\` and `"` need
 /// escaping for a plain filesystem path (no embedded newlines or control
 /// characters to worry about).
@@ -315,7 +367,12 @@ fn applyEdits(gpa: std.mem.Allocator, text_in: []const u8, edits: []const Edit, 
 /// way (`applyIfPresent`'s own logic: skip if its first edit's needle isn't
 /// there, since a sibling a `patch` needs edited on one CPython version may
 /// need nothing at all on another) -- a sibling with no `edits` at all is
-/// just copied through unmodified. Empty for a patch that needs nothing else
+/// just copied through unmodified. A sibling whose *file* doesn't exist at
+/// all on this CPython version (not just needing no edits -- e.g. 3.15 split
+/// `consts_getter.py` out of `deepfreeze.py`, which older versions don't
+/// have) is skipped entirely rather than `readFile`-panicking, the same
+/// exists-on-disk tolerance `deepfreezePatch` already uses for
+/// `pycore_interpframe.h`. Empty for a patch that needs nothing else
 /// alongside it.
 pub fn apply(
     b: *std.Build,
@@ -331,6 +388,7 @@ pub fn apply(
     const out = wf.add(std.fs.path.basename(patch.file), text);
     for (siblings) |sib| {
         const sib_path = b.pathJoin(&.{ cpython_dir_str, sib.file });
+        if (std.Io.Dir.cwd().access(b.graph.io, sib_path, .{})) |_| {} else |_| continue;
         const sib_original = readFile(b, gpa, sib_path);
         const sib_text = if (sib.edits.len > 0 and std.mem.indexOf(u8, sib_original, sib.edits[0].needle) != null)
             applyEdits(gpa, sib_original, sib.edits, sib_path, sib.reason)

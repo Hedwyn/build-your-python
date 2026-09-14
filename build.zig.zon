@@ -94,6 +94,15 @@
             .hash = "N-V-__8AAGxevgZa5YqaPjAumJtx4dq2jkX_Cbefo31dGs0Q",
             .lazy = true,
         },
+        // No 3.15.0 final tarball exists on python.org yet (as of this pin) -- only
+        // pre-releases up through rc2. Tracking rc2 here since CPython release
+        // candidates are feature/ABI-frozen (only bugfixes land before final); re-pin
+        // to the real `Python-3.15.0.tgz` URL/hash once it ships.
+        .@"3.15.0rc2" = .{
+            .url = "https://www.python.org/ftp/python/3.15.0/Python-3.15.0rc2.tgz",
+            .hash = "N-V-__8AANRqMQijW_j0XUr13pTDtnJiWxeSi5Wx8EHXHhgT",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
