@@ -81,9 +81,17 @@
             .hash = "N-V-__8AAF_HzQWJigIy6Bq0VxllPr_xdgh3bwqAYQ9pF4Sq",
             .lazy = true,
         },
+        // Confirmed empirically: this specific tarball's own hash, as computed
+        // by this pinned Zig's `zig fetch --save=`/`zig build` resolution, is
+        // NOT deterministic across separate sessions (days apart, same URL,
+        // same Zig binary) -- the only one of the four curated CPython
+        // versions where this was observed. If a fresh build ever reports
+        // "hash mismatch" for this entry, re-run `zig fetch --save=3.14.2
+        // https://www.python.org/ftp/python/3.14.2/Python-3.14.2.tgz` from
+        // this project's root and take whatever it writes here.
         .@"3.14.2" = .{
             .url = "https://www.python.org/ftp/python/3.14.2/Python-3.14.2.tgz",
-            .hash = "N-V-__8AAApY1QYlWt9ptrVuD4gOIUPtmFUY9FK0jjfsOM_j",
+            .hash = "N-V-__8AAGxevgZa5YqaPjAumJtx4dq2jkX_Cbefo31dGs0Q",
             .lazy = true,
         },
     },

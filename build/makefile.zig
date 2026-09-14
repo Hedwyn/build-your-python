@@ -161,10 +161,12 @@ pub const ModuleRule = struct {
 /// Finds the compile flags actually used to build a single object file, by
 /// locating its rule (`<obj>: <deps>[; <recipe>]`, recipe either inline after
 /// ';' or on the following backslash-continued tab lines) and pulling out
-/// everything between `$(CC)`/`$(LINKCC)` and ` -c `. Most modules delegate
-/// this to a `MODULE_<NAME>_CFLAGS`-style variable, but not all do (e.g.
-/// sha3module.o inlines its own `-I` flag) -- reading the real recipe avoids
-/// having to special-case every exception to that convention.
+/// the flags between `$(CC)`/`$(LINKCC)` and ` -c ` -- or, for the handful of
+/// rules that instead write `-c` immediately after `$(CC)` and place their
+/// flags after it (see `extractCcFlags`), between `-c` and ` -o `. Most
+/// modules delegate this to a `MODULE_<NAME>_CFLAGS`-style variable, but not
+/// all do (e.g. sha3module.o inlines its own `-I` flag) -- reading the real
+/// recipe avoids having to special-case every exception to that convention.
 pub fn findObjectFlags(mk: Makefile, gpa: std.mem.Allocator, obj_path: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, mk.text, '\n');
     while (lines.next()) |line| {
@@ -201,6 +203,17 @@ fn extractCcFlags(mk: Makefile, gpa: std.mem.Allocator, recipe: []const u8) ?[]c
     }
     if (!found) return null;
     const c_idx = std.mem.indexOf(u8, recipe[start..], " -c ") orelse return null;
+    if (c_idx == 0) {
+        // A few per-object rules (the HACL Blake2 SIMD128/256 objects) place
+        // their flags *after* `-c` rather than before it:
+        // `$(CC) -c $(LIBHACL_CFLAGS) $(LIBHACL_BLAKE2_SIMD128_CFLAGS) -o $@ <src>`.
+        // Without this branch the flags substring above is empty, silently
+        // dropping `-DHACL_CAN_COMPILE_VEC128`/`_VEC256` and the SSE/AVX2
+        // flags that gate `libintvector.h`'s type definitions.
+        const after_c = start + " -c ".len;
+        const o_idx = std.mem.indexOf(u8, recipe[after_c..], " -o ") orelse recipe.len - after_c;
+        return mk.expand(gpa, recipe[after_c .. after_c + o_idx]);
+    }
     return mk.expand(gpa, recipe[start .. start + c_idx]);
 }
 

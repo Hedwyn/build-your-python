@@ -31,6 +31,13 @@ pub fn findBundledArchive(path: []const u8) ?BundledArchive {
     return null;
 }
 
+fn containsToken(list: []const []const u8, tok: []const u8) bool {
+    for (list) |t| {
+        if (std.mem.eql(u8, t, tok)) return true;
+    }
+    return false;
+}
+
 /// Modules that only exist to exercise CPython's own test suite / C API
 /// internals -- never useful in a normal interpreter, so we don't build them.
 pub const skip_modules = std.StaticStringMap(void).initComptime(.{
@@ -752,16 +759,38 @@ pub fn addSharedModule(
     }
 
     for (rule.recipe) |tok| {
-        if (!std.mem.endsWith(u8, tok, ".a")) continue;
-        const archive = findBundledArchive(tok) orelse {
-            std.debug.print("warning: module '{s}' needs unrecognized archive '{s}', skipping\n", .{ name, tok });
-            return null;
-        };
-        mod.addCSourceFiles(.{
-            .root = cpython_dir,
-            .files = Makefile.objsToSources(gpa, mk.get(gpa, archive.objs_var)),
-            .flags = extractIncludePaths(mod, b, cpython_dir, gpa, Makefile.tokens(gpa, mk.get(gpa, archive.cflags_var))),
-        });
+        if (std.mem.endsWith(u8, tok, ".a")) {
+            const archive = findBundledArchive(tok) orelse {
+                std.debug.print("warning: module '{s}' needs unrecognized archive '{s}', skipping\n", .{ name, tok });
+                return null;
+            };
+            mod.addCSourceFiles(.{
+                .root = cpython_dir,
+                .files = Makefile.objsToSources(gpa, mk.get(gpa, archive.objs_var)),
+                .flags = extractIncludePaths(mod, b, cpython_dir, gpa, Makefile.tokens(gpa, mk.get(gpa, archive.cflags_var))),
+            });
+        } else if (std.mem.endsWith(u8, tok, ".o") and !containsToken(rule.prereqs, tok)) {
+            // A bare object token in the *link* recipe, not a `.a` archive and
+            // not already compiled via the `rule.prereqs` loop above (that
+            // check matters: a simple module's own primary object -- e.g.
+            // `_ssl.c`'s `Modules/_ssl.o` -- is both a prereq *and* one of
+            // the tokens the recipe links, so without it every such module
+            // would get its own source compiled twice, `ld.lld: duplicate
+            // symbol: PyInit__ssl`). What this branch is actually for:
+            // `_blake2`'s MODULE__BLAKE2_LDFLAGS is `$(LIBHACL_BLAKE2_OBJS)`
+            // itself (new in CPython 3.14; every other bundled-C-library
+            // module wraps its objects in an intermediate `.a` first) --
+            // never a prereq, so silently missing from the link line
+            // otherwise: the module still builds, `dlopen()` still succeeds,
+            // but every symbol these objects would have defined is undefined
+            // until first referenced, e.g. `Hacl_Hash_Blake2s_free`.
+            const src = b.fmt("{s}c", .{tok[0 .. tok.len - 1]});
+            const flags_raw = if (mk.findObjectFlags(gpa, tok)) |f| Makefile.tokens(gpa, f) else fallback_cflags_raw;
+            mod.addCSourceFile(.{
+                .file = cpython_dir.path(b, src),
+                .flags = extractIncludePaths(mod, b, cpython_dir, gpa, flags_raw),
+            });
+        }
     }
     applyLinkTokens(mod, link_tokens, overrides);
 
