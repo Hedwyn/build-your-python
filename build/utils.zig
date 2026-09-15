@@ -115,6 +115,11 @@ fn gnuArchTriple(b: *std.Build, result: std.Target) []const u8 {
     });
 }
 
+/// Bare name `writeBuildPythonStub` writes the stub under, inside
+/// `cpython_dir`. Its own doc comment explains why the function returns
+/// `"./" ++ build_python_stub_name` rather than a `cpython_dir`-joined path.
+const build_python_stub_name = ".metapython-build-python-stub.sh";
+
 /// A stub good enough to satisfy `./configure --with-build-python=`'s own check
 /// (a `command -v` lookup, then one `$path -c "import sys; print(...)"` call to
 /// read back a version string) without an actual, working, host-native CPython
@@ -125,6 +130,24 @@ fn gnuArchTriple(b: *std.Build, result: std.Target) []const u8 {
 /// its own host-native `freeze_module`/`_bootstrap_python` Zig steps instead).
 /// Version is read out of `./configure` itself (`PACKAGE_VERSION='X.Y'`) rather
 /// than hardcoded, so a submodule bump can't silently desync the two.
+///
+/// Returns `"./" ++ build_python_stub_name`, not the `cpython_dir`-joined
+/// `stub_path` used for the write below: the `./configure` process this is
+/// handed to (`--with-build-python=`) already runs with `cwd` set to
+/// `cpython_dir` (see `runConfigure`), and `cpython_dir` is not reliably
+/// absolute -- confirmed empirically for a `-Dcpython-version=` dependency
+/// fetched into this pinned Zig's project-local `zig-pkg/` cache, which comes
+/// back as a path relative to the build root rather than an absolute one
+/// (see `cpython_source.zig`'s own doc comment on why that cache is
+/// project-local at all). Joining that relative `cpython_dir` onto the stub
+/// path and handing the result to a process whose `cwd` is *already*
+/// `cpython_dir` looks `cpython_dir` up a second, nonexistent time on top of
+/// itself -- `configure`'s `--with-build-python` check then reports the
+/// binary "invalid or missing", since nothing exists at that doubled path.
+/// The leading `"./"` matters too: `configure`'s check is a shell `command -v
+/// $with_build_python`, and a name with no `/` in it is a `$PATH` lookup, not
+/// a cwd-relative one -- it would never find a script sitting right next to
+/// it otherwise.
 fn writeBuildPythonStub(b: *std.Build, cpython_dir: []const u8) []const u8 {
     const gpa = b.allocator;
     const configure_path = b.pathJoin(&.{ cpython_dir, "configure" });
@@ -138,14 +161,14 @@ fn writeBuildPythonStub(b: *std.Build, cpython_dir: []const u8) []const u8 {
         std.debug.panic("malformed PACKAGE_VERSION in {s}", .{configure_path});
     const version = rest[0..end];
 
-    const stub_path = b.pathJoin(&.{ cpython_dir, ".metapython-build-python-stub.sh" });
+    const stub_path = b.pathJoin(&.{ cpython_dir, build_python_stub_name });
     std.Io.Dir.cwd().writeFile(b.graph.io, .{
         .sub_path = stub_path,
         .data = b.fmt("#!/bin/sh\necho {s}\n", .{version}),
     }) catch |err| std.debug.panic("failed to write {s}: {t}", .{ stub_path, err });
     std.Io.Dir.cwd().setFilePermissions(b.graph.io, stub_path, .executable_file, .{}) catch |err|
         std.debug.panic("failed to chmod {s}: {t}", .{ stub_path, err });
-    return stub_path;
+    return "./" ++ build_python_stub_name;
 }
 
 pub fn runConfigure(

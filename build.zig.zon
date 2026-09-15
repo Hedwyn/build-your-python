@@ -81,17 +81,26 @@
             .hash = "N-V-__8AAF_HzQWJigIy6Bq0VxllPr_xdgh3bwqAYQ9pF4Sq",
             .lazy = true,
         },
-        // Confirmed empirically: this specific tarball's own hash, as computed
-        // by this pinned Zig's `zig fetch --save=`/`zig build` resolution, is
-        // NOT deterministic across separate sessions (days apart, same URL,
-        // same Zig binary) -- the only one of the four curated CPython
-        // versions where this was observed. If a fresh build ever reports
-        // "hash mismatch" for this entry, re-run `zig fetch --save=3.14.2
-        // https://www.python.org/ftp/python/3.14.2/Python-3.14.2.tgz` from
-        // this project's root and take whatever it writes here.
+        // Not python.org for this one, unlike the other three: confirmed
+        // empirically (two separate `zig build`-triggered fetches, same URL,
+        // same Zig binary, genuine cold caches) that python.org's CDN served
+        // this particular file as different bytes -- and therefore a
+        // different Zig package hash -- per request, so no hash pinned
+        // against it stayed valid for long. GitHub's tag archive is Zig's
+        // own usual answer to exactly this (see zlib/libffi/bzip2 above);
+        // confirmed stable across two `zig build`-triggered fetches the same
+        // way. If a fresh build ever reports "hash mismatch" for this entry
+        // again regardless, re-derive the hash the same way it was derived
+        // here: per the note above (lines 61-68) `zig fetch`/`zig fetch
+        // --save=`, even run from this exact project root, reliably prints a
+        // hash *other* than the one `zig build` itself will then check
+        // against -- so don't trust that output for this entry (or the three
+        // above it) either. Instead read the real one off `zig build`'s own
+        // "hash mismatch: ... but the fetched package has X" error (trigger
+        // it once with any placeholder hash) and write X here.
         .@"3.14.2" = .{
-            .url = "https://www.python.org/ftp/python/3.14.2/Python-3.14.2.tgz",
-            .hash = "N-V-__8AAGxevgZa5YqaPjAumJtx4dq2jkX_Cbefo31dGs0Q",
+            .url = "https://github.com/python/cpython/archive/refs/tags/v3.14.2.tar.gz",
+            .hash = "N-V-__8AADsJzwYOaKToupbULq5xl4CPRGnALYvMF1mCSv60",
             .lazy = true,
         },
         // No 3.15.0 final tarball exists on python.org yet (as of this pin) -- only
