@@ -171,6 +171,68 @@ fn writeBuildPythonStub(b: *std.Build, cpython_dir: []const u8) []const u8 {
     return "./" ++ build_python_stub_name;
 }
 
+/// Bare name `writePkgConfigWrapper` writes its wrapper script under, inside
+/// `cpython_dir` -- same as `writeBuildPythonStub` above, but returned as an
+/// *absolute* path instead of that function's `"./"`-relative one: `PKG_CONFIG=`
+/// is only honored as a direct override by `configure.ac` when it looks
+/// absolute (`case $PKG_CONFIG in [\\/]* | ?:[\\/]*)`) -- a relative one falls
+/// through to a `$PATH` search instead, which does not know what to do with a
+/// literal `./` prefix (see `writePkgConfigWrapper`'s own doc).
+const pkg_config_wrapper_name = ".metapython-pkg-config-wrapper.sh";
+
+/// A `pkg-config`-compatible wrapper that answers "not found" for `libb2`
+/// specifically and delegates everything else verbatim to the real `pkg-config`
+/// on `$PATH` -- `_blake2`'s own optional `libb2` accelerator (see
+/// `runConfigure`'s own doc on it below) is the *only* thing that needs pkg-config
+/// kept from seeing a real system library it has no linkage option of its own to
+/// gate on; openssl/bz2/sqlite3/lzma's own detection all still need pkg-config
+/// answering *honestly* for anything else they ask it (their own `ac_cv_*` cache
+/// seeds only short-circuit a later "does it actually link" check -- the earlier,
+/// always-run include/lib-path composition upstream of that still consults
+/// `$PKG_CONFIG` first and, on failure, falls through to a hardcoded host
+/// `ssldirs`-style search that adds an explicit `-I` for whatever it finds --
+/// disabling pkg-config outright (`--with-pkg-config=no`, tried first) broke
+/// that path for a real, working system OpenSSL install, feeding its host
+/// `/usr/include` into the cross target's own compile).
+///
+/// Set as `PKG_CONFIG=<this wrapper>` (an absolute-looking value, so both of
+/// `configure.ac`'s independent `$PKG_CONFIG` resolutions -- see `runConfigure`'s
+/// own doc -- take it directly, `case $PKG_CONFIG in [\\/]* | ?:[\\/]*)`, without
+/// searching `$PATH` at all), not a cache variable: unlike `ac_cv_path_PKG_CONFIG`/
+/// `ac_cv_prog_PKG_CONFIG`, this one is not cleared out from under a seed by
+/// `configure`'s own `--with-pkg-config=yes|check` staleness guard.
+fn writePkgConfigWrapper(b: *std.Build, cpython_dir: []const u8) []const u8 {
+    const wrapper_path = b.pathJoin(&.{ cpython_dir, pkg_config_wrapper_name });
+    std.Io.Dir.cwd().writeFile(b.graph.io, .{
+        .sub_path = wrapper_path,
+        .data =
+        \\#!/bin/sh
+        \\for arg in "$@"; do
+        \\    case "$arg" in
+        \\        libb2) exit 1 ;;
+        \\    esac
+        \\done
+        \\exec pkg-config "$@"
+        \\
+        ,
+    }) catch |err| std.debug.panic("failed to write {s}: {t}", .{ wrapper_path, err });
+    std.Io.Dir.cwd().setFilePermissions(b.graph.io, wrapper_path, .executable_file, .{}) catch |err|
+        std.debug.panic("failed to chmod {s}: {t}", .{ wrapper_path, err });
+    // Absolute, not `wrapper_path` verbatim: `cpython_dir` (and so `wrapper_path`,
+    // built from it) is itself potentially build-root-relative for a
+    // `-Dcpython-version=` dependency fetched into this pinned Zig's
+    // project-local `zig-pkg/` (see `writeBuildPythonStub`'s own doc on the same
+    // gotcha, and `build/utils.zig`'s sqlite3 `LIBSQLITE3_CFLAGS` fix for another
+    // instance of it) -- `PKG_CONFIG=`, unlike `--with-build-python=`, needs a
+    // value `configure.ac` recognizes as absolute to take it as a direct
+    // override at all (see this function's own doc), so a relative one has to
+    // be resolved against the real build root here, not left as `wrapper_path`.
+    if (std.fs.path.isAbsolute(wrapper_path)) return wrapper_path;
+    const build_root = b.root.root_dir.path orelse
+        std.debug.panic("expected absolute build root path", .{});
+    return b.pathJoin(&.{ build_root, wrapper_path });
+}
+
 pub fn runConfigure(
     b: *std.Build,
     cpython_dir: []const u8,
@@ -282,8 +344,32 @@ pub fn runConfigure(
     if (options.sqlite_linkage == .static) {
         const sqlite3_dep = b.dependency("sqlite3", .{ .target = target, .optimize = optimize });
         const sqlite3_src = sqlite3_dep.builder.dependency("sqlite3", .{});
-        const sqlite3_src_dir = sqlite3_src.builder.root.root_dir.path orelse
-            std.debug.panic("expected absolute sqlite3 dependency root path", .{});
+        const sqlite3_src_dir_raw = sqlite3_src.builder.root.root_dir.path orelse
+            std.debug.panic("expected a sqlite3 dependency root path", .{});
+        // This pinned Zig fetches dependencies into a project-local `zig-pkg/`
+        // (see build/cpython_source.zig's own doc comment), and `root_dir.path`
+        // for one comes back *relative to this project's own build root*, not
+        // absolute -- fine as long as whatever consumes it also runs from that
+        // same build root, but `./configure` (and every compiler invocation it
+        // spawns) runs from `cpython_dir` instead (a sibling `zig-pkg/<hash>/`
+        // directory, itself the very same kind of build-root-relative path).
+        // A relative `-I` flag passed to it therefore resolves against the
+        // *wrong* base (`<build-root>/zig-pkg/<cpython-hash>/zig-pkg/<sqlite3-
+        // hash>`, which doesn't exist) instead of the intended
+        // `<build-root>/zig-pkg/<sqlite3-hash>` -- silently, since a missing
+        // `-I` directory is not itself an error, it just means `sqlite3.h`
+        // isn't found there either, and `AC_CHECK_HEADER([sqlite3.h])`'s own
+        // uncached version-number probe (see this block's own doc above) has
+        // no cache variable to paper over that with, unlike every other check
+        // here. Joining it onto the real build root (absolute; see `build.zig`'s
+        // own `b.root.root_dir.path` at its own top level) makes the flag
+        // correct regardless of which directory `./configure` actually runs in.
+        const build_root = b.root.root_dir.path orelse
+            std.debug.panic("expected absolute build root path", .{});
+        const sqlite3_src_dir = if (std.fs.path.isAbsolute(sqlite3_src_dir_raw))
+            sqlite3_src_dir_raw
+        else
+            b.pathJoin(&.{ build_root, sqlite3_src_dir_raw });
         cache_vars.appendSlice(b.allocator, &.{
             b.fmt("LIBSQLITE3_CFLAGS=-I{s}", .{sqlite3_src_dir}),
             "LIBSQLITE3_LIBS=-lsqlite3",
@@ -309,19 +395,60 @@ pub fn runConfigure(
             "ac_cv_lib_lzma_lzma_easy_encoder=yes",
         }) catch @panic("OOM");
     }
-    // bz2's, sqlite3's, and liblzma's own `PKG_CHECK_MODULES` calls happily use a
-    // *host* `.pc` file if one is installed, regardless of target -- pkg-config has
-    // no notion of the cross target `CC` is otherwise correctly configured for
-    // (confirmed: this build host has `bzip2.pc`, `sqlite3.pc`, *and* `liblzma.pc`).
-    // Forcing the cache variable that decides whether a usable `pkg-config` exists at
-    // all (see vendored_libraries_plan.md's `_blake2` section, which diagnosed this
-    // same variable for the same reason) routes all three through the fallback
-    // branches the seeds above actually target, on every build host alike.
-    if (options.bz2_linkage == .static or options.sqlite_linkage == .static or
-        options.lzma_linkage == .static)
-    {
-        cache_vars.append(b.allocator, "ac_cv_path_PKG_CONFIG=") catch @panic("OOM");
-    }
+    // `_blake2`'s own optional `libb2` accelerator has no linkage option of its
+    // own to gate this on: even with CPython's bundled HACL* implementation
+    // selected by default (`with_builtin_blake2=yes`), `configure.ac` *still*
+    // separately probes for a system `libb2` via `PKG_CHECK_MODULES` and prefers
+    // it if pkg-config reports one -- which it does on any build host that
+    // happens to have a `libb2.pc` installed, regardless of target, making the
+    // whole module unbuildable for a cross target (see `unprovidableLibrary`'s
+    // own doc) purely because of what's installed *here*.
+    //
+    // Disabling pkg-config outright first (`--with-pkg-config=no`, or seeding
+    // its own `ac_cv_path_PKG_CONFIG`/`ac_cv_prog_PKG_CONFIG` cache variables
+    // empty) broke a *different*, previously-working case: `openssl_linkage`'s
+    // own detection (`AC_ARG_WITH([openssl], ...)`'s `else` branch -- reached
+    // whenever `--with-openssl=` itself isn't passed, which this project never
+    // does, static or not) *also* asks `$PKG_CONFIG` first for a real system
+    // OpenSSL, and only falls through to a hardcoded `ssldirs="... /usr"` search
+    // if that fails -- a search whose explicit `-I$ssldir/include` (unlike
+    // pkg-config's own `--cflags-only-I`, which omits a default search path
+    // entirely) leaked this build host's own `/usr/include` into the target
+    // compile once pkg-config could no longer answer that question at all
+    // (confirmed: `_ssl.c`/`_hashlib` picking up host `pthread.h` and failing on
+    // x86-only attributes for an `aarch64-linux-gnu` target -- `ac_cv_working_
+    // openssl_ssl=yes`/`ac_cv_working_openssl_hashlib=yes` only short-circuit a
+    // *later* "does it actually link" check, not this earlier include/lib-path
+    // composition). Disabling pkg-config for everything is too broad a hammer:
+    // `_blake2` is the only thing that needs pkg-config kept from seeing a real
+    // system library it has no linkage knob for -- bz2/sqlite3/lzma/openssl all
+    // still need it answering *honestly* for anything else they ask.
+    //
+    // `writePkgConfigWrapper` is the scoped fix: a `pkg-config`-compatible
+    // wrapper that fails only for `libb2` and delegates every other query
+    // (openssl, bz2, sqlite3, liblzma, ...) straight to the real `pkg-config` on
+    // `$PATH`, unchanged from before this whole investigation started. Handed to
+    // `configure` as `PKG_CONFIG=<wrapper>` (a plain variable override, not a
+    // cache-variable seed): both of `configure.ac`'s independent `$PKG_CONFIG`
+    // resolutions honor a pre-set, absolute-looking `$PKG_CONFIG` directly
+    // (`case $PKG_CONFIG in [\\/]* | ?:[\\/]*)`) without searching `$PATH` at
+    // all, so there is no `ac_pt`/`ac_ct` fallback pair left to fight (unlike
+    // `--with-pkg-config=no`/a cache-variable seed, which `configure`'s own
+    // `--with-pkg-config=yes|check` staleness guard silently discarded for
+    // exactly that fallback pair -- confirmed directly in a real `--host=
+    // aarch64-linux-gnu` config.log).
+    //
+    // (Two dead ends tried first, per vendored_libraries_plan.md's `_blake2`
+    // section: `PKG_CONFIG=/bin/false` -- pkg.m4 rejects a tool that fails
+    // `--version` and searches `$PATH` again -- and pre-setting `LIBB2_CFLAGS`/
+    // `LIBB2_LIBS` directly -- pkg.m4 then assumes success, which is worse.
+    // `--with-pkg-config=no` was tried next, working for `_blake2` alone but
+    // regressing openssl as described above; a `PKG_CONFIG=` wrapper was not
+    // tried in that doc.)
+    cache_vars.append(
+        b.allocator,
+        b.fmt("PKG_CONFIG={s}", .{writePkgConfigWrapper(b, cpython_dir)}),
+    ) catch @panic("OOM");
 
     // Real `--host` cross mode (see `cross_arch` above) makes CPython's own
     // configure.ac answer nearly every feature check from its own built-in,

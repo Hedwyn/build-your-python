@@ -345,34 +345,31 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     const cpython_dir = cpython.dir;
     const prefix = b.pathJoin(&.{ build_root, "zig-out" });
 
-    // sqlite3 static linking doesn't work yet for a genuinely different CPU
-    // architecture than the build machine's own (same-arch targets --
-    // native, or musl-on-glibc -- are unaffected, so this is gated on that
-    // specifically, not on cross-compiling in general): `./configure`'s
-    // uncached `AC_CHECK_HEADER([sqlite3.h])` probe (see build/utils.zig's
-    // sqlite3 `LIBSQLITE3_CFLAGS=-I...` cache-var seed) fails to find the
-    // header under real `--host` cross mode -- the `-I` path it seeds is
-    // captured relative to a cwd that probe doesn't share. Panic with an
-    // actionable message instead of letting this surface as a confusing
-    // downstream compile failure -- see roadmap.md for the full
-    // investigation and what unblocking it would take.
+    // sqlite3 static linking used not to work for a genuinely different CPU
+    // architecture than the build machine's own (same-arch targets -- native,
+    // or musl-on-glibc -- were unaffected): `./configure`'s uncached
+    // `AC_CHECK_HEADER([sqlite3.h])` probe (see build/utils.zig's sqlite3
+    // `LIBSQLITE3_CFLAGS=-I...` cache-var seed) failed to find the header under
+    // real `--host` cross mode. Root cause: this pinned Zig fetches
+    // dependencies into a project-local `zig-pkg/` (build/cpython_source.zig's
+    // own doc comment), and a fetched dependency's `root_dir.path` comes back
+    // relative to this project's own build root, not absolute -- but
+    // `./configure` (and everything it spawns) runs from `cpython_dir` instead,
+    // itself another such build-root-relative `zig-pkg/<hash>/` directory, so
+    // the relative `-I` flag resolved against the wrong base entirely. Fixed by
+    // joining it onto the real (absolute) build root before use -- see
+    // build/utils.zig's own doc comment on that fix. Verified end to end for
+    // `-Dtarget=aarch64-linux-gnu` (a genuine x86_64-host cross build, not just
+    // same-arch): `_sqlite3.cpython-312-aarch64-linux-gnu.so` built, links no
+    // `libsqlite3.so` (`readelf -d`), and a real `sqlite3.connect(':memory:')`
+    // create/insert/select round-trip ran correctly under `qemu-aarch64-static`.
     //
-    // openssl used to have the same restriction (the old
+    // openssl used to have the same restriction for an unrelated reason (the old
     // `allyourcodebase/openssl` package's build.zig unconditionally built
     // x86_64 inline-asm sources with no ARM/etc. equivalent) -- fixed by
     // vendoring OpenSSL from scratch with assembly optimizations off, which
     // is arch-agnostic by construction (see vendoring/openssl/build.zig).
     const cross_arch = target.result.cpu.arch != b.graph.host.result.cpu.arch;
-    if (cross_arch) {
-        const host_arch_name = @tagName(b.graph.host.result.cpu.arch);
-        const target_arch_name = @tagName(target.result.cpu.arch);
-        if (options.sqlite_linkage == .static) std.debug.panic(
-            "-Dsqlite-linkage=static is not supported yet when cross-compiling to a " ++
-                "different CPU architecture ({s} host -> {s} target) -- pass " ++
-                "-Dsqlite-linkage=off (or =dynamic, if the target has a system sqlite3) instead",
-            .{ host_arch_name, target_arch_name },
-        );
-    }
 
     // Stage 1/2 below (freeze_module_exe, bootstrap_exe) are host-native tools,
     // same as buildWindows' own bootstrap stage -- but unlike buildWindows (which
