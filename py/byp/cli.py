@@ -23,7 +23,6 @@ except ImportError:
     )
     raise SystemExit(1) from None
 
-from . import fetch as fetch_
 from .compile import (
     BuildOptions,
     BuildStep,
@@ -106,25 +105,6 @@ def cli(log_level: str, verbose: int) -> None:
 
 @cli.command()
 @click.option(
-    "--url",
-    default=fetch_.MIRROR_URL,
-    show_default=True,
-    help="Zig toolchain archive URL.",
-)
-@click.option(
-    "--target",
-    type=click.Path(path_type=Path, file_okay=False),
-    default=None,
-    help="Directory to place the downloaded archive in (default: a temp dir, removed after).",
-)
-def fetch(url: str, target: Path | None) -> None:
-    """Download the pinned Zig toolchain."""
-    with fetch_.fetch(url, target=target) as archive:
-        click.echo(archive)
-
-
-@cli.command()
-@click.option(
     "--target", "zig_target", default=None, help="Zig target triple (-Dtarget=)."
 )
 @click.option(
@@ -188,7 +168,7 @@ def fetch(url: str, target: Path | None) -> None:
     "--zig",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
-    help="Path to the `zig` executable (default: fetch the pinned toolchain).",
+    help="Path to the `zig` executable (default: the `ziglang` package's).",
 )
 @click.argument("extra_args", nargs=-1, type=click.UNPROCESSED)
 def build(

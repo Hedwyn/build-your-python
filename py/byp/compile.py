@@ -9,13 +9,13 @@ on build.zig.
 from __future__ import annotations
 
 import subprocess
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Literal
 
-from . import fetch
 from .pyconfig import MacroPatch
 
 
@@ -145,17 +145,17 @@ def zig_build(
 ) -> subprocess.CompletedProcess[bytes]:
     """Invoke `zig build` with `options`.
 
-    `zig` is the path to the `zig` executable; if omitted, the pinned
-    toolchain is fetched (see `byp.fetch`) and used.
+    `zig` is the path to the `zig` executable; if omitted, the one shipped
+    by the `ziglang` PyPI package is used (`python -m ziglang`).
 
     `cwd` is the directory to run `zig build` from, i.e. where it looks for
     `build.zig` and, relative to that, the `cpython` source tree. If omitted,
     defaults to the vendored copy bundled in this package (`VENDORED_PROJECT_DIR`).
     """
-    executable = zig if zig is not None else fetch.zig_toolchain()
+    command = [str(zig)] if zig is not None else [sys.executable, "-m", "ziglang"]
     directory = cwd if cwd is not None else VENDORED_PROJECT_DIR
     args = [
-        str(executable),
+        *command,
         "build",
         step.value,
         *options.to_args(),

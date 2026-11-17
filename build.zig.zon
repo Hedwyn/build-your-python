@@ -1,7 +1,7 @@
 .{
     .name = .byp,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0-dev.1941",
+    .minimum_zig_version = "0.17.0",
     .fingerprint = 0x1aea75df6c046e4e,
     .dependencies = .{
         .zlib = .{
