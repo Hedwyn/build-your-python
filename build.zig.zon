@@ -103,13 +103,9 @@
             .hash = "N-V-__8AADsJzwYOaKToupbULq5xl4CPRGnALYvMF1mCSv60",
             .lazy = true,
         },
-        // No 3.15.0 final tarball exists on python.org yet (as of this pin) -- only
-        // pre-releases up through rc2. Tracking rc2 here since CPython release
-        // candidates are feature/ABI-frozen (only bugfixes land before final); re-pin
-        // to the real `Python-3.15.0.tgz` URL/hash once it ships.
-        .@"3.15.0rc2" = .{
-            .url = "https://www.python.org/ftp/python/3.15.0/Python-3.15.0rc2.tgz",
-            .hash = "N-V-__8AANRqMQijW_j0XUr13pTDtnJiWxeSi5Wx8EHXHhgT",
+        .@"3.15.0" = .{
+            .url = "https://www.python.org/ftp/python/3.15.0/Python-3.15.0.tgz",
+            .hash = "N-V-__8AAGLgNAjp_hI-BKPlYa57uIspdNWwsVE4YefNS4-b",
             .lazy = true,
         },
     },
