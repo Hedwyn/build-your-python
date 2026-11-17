@@ -9,7 +9,7 @@ Two ways to use it, matching the two Zig-side entry points:
 
 * Hand the patches to `zig build` and let it do the rewriting:
   `BuildOptions(pyconfig_macros=(...))` renders them as
-  `-Dpyconfig-define=`/`-Dpyconfig-undef=` (see `metapython.compile`).
+  `-Dpyconfig-define=`/`-Dpyconfig-undef=` (see `byp.compile`).
 * Or rewrite a `pyconfig.h` here and pass the result as
   `BuildOptions(pyconfig_header=...)`: `apply_patches` is the primitive for
   that, and `cross_patches` gives the same list build.zig would have applied

@@ -1,5 +1,5 @@
 """
-Metapython.fetch: download the pinned Zig toolchain (build.zig.zon's
+byp.fetch: download the pinned Zig toolchain (build.zig.zon's
 minimum_zig_version, a 0.17 dev release not yet published to the `ziglang`
 PyPI package) and stage it on disk.
 
@@ -23,7 +23,7 @@ MIRROR_URL = (
     "https://ziglang.org/builds/zig-x86_64-linux-0.17.0-dev.1941+71115f0ab.tar.xz"
 )
 
-DEFAULT_CACHE_DIR = Path.home() / ".cache" / "metapython" / "zig"
+DEFAULT_CACHE_DIR = Path.home() / ".cache" / "byp" / "zig"
 
 _logger = logging.getLogger(__name__)
 

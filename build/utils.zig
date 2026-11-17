@@ -118,7 +118,7 @@ fn gnuArchTriple(b: *std.Build, result: std.Target) []const u8 {
 /// Bare name `writeBuildPythonStub` writes the stub under, inside
 /// `cpython_dir`. Its own doc comment explains why the function returns
 /// `"./" ++ build_python_stub_name` rather than a `cpython_dir`-joined path.
-const build_python_stub_name = ".metapython-build-python-stub.sh";
+const build_python_stub_name = ".byp-build-python-stub.sh";
 
 /// A stub good enough to satisfy `./configure --with-build-python=`'s own check
 /// (a `command -v` lookup, then one `$path -c "import sys; print(...)"` call to
@@ -178,7 +178,7 @@ fn writeBuildPythonStub(b: *std.Build, cpython_dir: []const u8) []const u8 {
 /// absolute (`case $PKG_CONFIG in [\\/]* | ?:[\\/]*)`) -- a relative one falls
 /// through to a `$PATH` search instead, which does not know what to do with a
 /// literal `./` prefix (see `writePkgConfigWrapper`'s own doc).
-const pkg_config_wrapper_name = ".metapython-pkg-config-wrapper.sh";
+const pkg_config_wrapper_name = ".byp-pkg-config-wrapper.sh";
 
 /// A `pkg-config`-compatible wrapper that answers "not found" for `libb2`
 /// specifically and delegates everything else verbatim to the real `pkg-config`
@@ -493,7 +493,7 @@ pub fn runConfigure(
     argv_list.appendSlice(b.allocator, cache_vars.items) catch @panic("OOM");
     const argv = argv_list.items;
 
-    const stamp_path = b.pathJoin(&.{ cpython_dir, ".metapython-configure-stamp" });
+    const stamp_path = b.pathJoin(&.{ cpython_dir, ".byp-configure-stamp" });
     const fingerprint = configureFingerprint(b, argv, pyconfig_header);
     const makefile_path = b.pathJoin(&.{ cpython_dir, "Makefile" });
     const stale = stale: {

@@ -1,6 +1,6 @@
 """
-Command-line interface to metapython. Requires the optional `cli` extra
-(`click`): `uv pip install metapython[cli]`.
+Command-line interface to byp. Requires the optional `cli` extra
+(`click`): `uv pip install build-your-python[cli]`.
 
 @date: 31.08.2026
 @author: Baptiste Pestourie
@@ -18,7 +18,7 @@ try:
     import click
 except ImportError:
     print(
-        "metapython.cli requires the 'cli' extra: uv pip install metapython[cli]",
+        "byp.cli requires the 'cli' extra: uv pip install build-your-python[cli]",
         file=sys.stderr,
     )
     raise SystemExit(1) from None

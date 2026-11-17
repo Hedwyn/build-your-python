@@ -86,7 +86,7 @@ class BuildOptions:
     pyconfig_header: Path | None = None
     #: `pyconfig.h` macro overrides, applied on top of whatever `./configure`
     #: produced *and* on top of this project's own automatic musl/cross fixups
-    #: (see `metapython.pyconfig`, and `build/pyconfig.zig` for the Zig side
+    #: (see `byp.pyconfig`, and `build/pyconfig.zig` for the Zig side
     #: that actually rewrites the header). Later entries win, so these override
     #: the built-in fixups rather than the other way round. Lets a caller
     #: correct a single misdetected macro without hand-maintaining a whole
@@ -146,7 +146,7 @@ def zig_build(
     """Invoke `zig build` with `options`.
 
     `zig` is the path to the `zig` executable; if omitted, the pinned
-    toolchain is fetched (see `metapython.fetch`) and used.
+    toolchain is fetched (see `byp.fetch`) and used.
 
     `cwd` is the directory to run `zig build` from, i.e. where it looks for
     `build.zig` and, relative to that, the `cpython` source tree. If omitted,

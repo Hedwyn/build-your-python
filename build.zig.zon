@@ -1,8 +1,8 @@
 .{
-    .name = .meta_python,
+    .name = .byp,
     .version = "0.1.0",
     .minimum_zig_version = "0.17.0-dev.1941",
-    .fingerprint = 0xb68c175e8c6315d7,
+    .fingerprint = 0x1aea75df6c046e4e,
     .dependencies = .{
         .zlib = .{
             .url = "https://github.com/allyourcodebase/zlib/archive/refs/tags/1.3.2.tar.gz",

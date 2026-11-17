@@ -424,7 +424,7 @@ fn buildPosix(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         native_options.pyconfig_header = null;
         Utils.runConfigure(b, cpython_dir_str, prefix, b.graph.host, .Debug, native_options);
 
-        const snapshot_dir = b.pathJoin(&.{ build_root, ".zig-cache", "metapython-native-pyconfig" });
+        const snapshot_dir = b.pathJoin(&.{ build_root, ".zig-cache", "byp-native-pyconfig" });
         std.Io.Dir.cwd().createDirPath(b.graph.io, snapshot_dir) catch |err|
             std.debug.panic("failed to create {s}: {t}", .{ snapshot_dir, err });
         const native_pyconfig_h_path = b.pathJoin(&.{ cpython_dir_str, "pyconfig.h" });

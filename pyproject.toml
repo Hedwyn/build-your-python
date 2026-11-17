@@ -1,5 +1,5 @@
 [project]
-name = "metapython"
+name = "build-your-python"
 version = "0.1.0"
 description = "A Python library to build your own CPython executable"
 requires-python = ">=3.12"
@@ -9,19 +9,19 @@ dependencies = []
 cli = ["click"]
 
 [project.scripts]
-metapython = "metapython.cli:main"
+byp = "byp.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["py/metapython"]
+packages = ["py/byp"]
 exclude = ["cpython/.git"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"build.zig" = "metapython/_vendor/build.zig"
-"build.zig.zon" = "metapython/_vendor/build.zig.zon"
-"build" = "metapython/_vendor/build"
-"cpython" = "metapython/_vendor/cpython"
-"vendoring" = "metapython/_vendor/vendoring"
+"build.zig" = "byp/_vendor/build.zig"
+"build.zig.zon" = "byp/_vendor/build.zig.zon"
+"build" = "byp/_vendor/build"
+"cpython" = "byp/_vendor/cpython"
+"vendoring" = "byp/_vendor/vendoring"
