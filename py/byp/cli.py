@@ -1,6 +1,5 @@
 """
-Command-line interface to byp. Requires the optional `cli` extra
-(`click`): `uv pip install build-your-python[cli]`.
+Command-line interface to byp.
 
 @date: 31.08.2026
 @author: Baptiste Pestourie
@@ -9,19 +8,11 @@ Command-line interface to byp. Requires the optional `cli` extra
 from __future__ import annotations
 
 import logging
-import sys
 from collections.abc import Iterable
 from pathlib import Path
 from typing import get_args
 
-try:
-    import click
-except ImportError:
-    print(
-        "byp.cli requires the 'cli' extra: uv pip install build-your-python[cli]",
-        file=sys.stderr,
-    )
-    raise SystemExit(1) from None
+import click
 
 from .compile import (
     BuildOptions,
